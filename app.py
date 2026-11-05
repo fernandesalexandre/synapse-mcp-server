@@ -78,10 +78,10 @@ TOOLS_SCHEMA = [
     }
 ]
 
-def execute_ler_fila(arguments):
+def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"):
     target_queue = arguments.get("target_queue", "WAITING_ALITA")
     limit = int(arguments.get("limit", 5))
-    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?target_queue=eq.{urllib.parse.quote(target_queue)}&order=created_at.desc&limit={limit}"
+    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?tenant_id=eq.{tenant_id}&target_queue=eq.{urllib.parse.quote(target_queue)}&order=created_at.desc&limit={limit}"
     req = urllib.request.Request(url, headers={
         "apikey": API_KEY,
         "Authorization": f"Bearer {API_KEY}",
@@ -91,7 +91,7 @@ def execute_ler_fila(arguments):
         data = json.loads(resp.read().decode("utf-8"))
         return data
 
-def execute_enviar_mensagem(arguments):
+def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000000001"):
     destinatario = arguments.get("destinatario", "ISAAC").strip().upper()
     mensagem = arguments.get("mensagem", "")
     tarefa_origem_id = arguments.get("tarefa_origem_id")
@@ -109,6 +109,7 @@ def execute_enviar_mensagem(arguments):
     payload_body = {
         "remetente": "ALITA",
         "target_queue": "WAITING_ANTIGRAVITY",
+        "tenant_id": tenant_id,
         "payload": f"{header}{mensagem}",
         "status": "WAITING_ANTIGRAVITY"
     }
@@ -131,11 +132,11 @@ def execute_enviar_mensagem(arguments):
         data = json.loads(resp.read().decode("utf-8"))
         return {"status": "ENVIADO_COM_SUCESSO", "registro": data}
 
-def execute_atualizar_status(arguments):
+def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-000000000001"):
     tarefa_id = arguments.get("tarefa_id")
     novo_status = arguments.get("novo_status")
 
-    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}"
+    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
     payload_body = {"status": novo_status}
 
     req = urllib.request.Request(
@@ -170,7 +171,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 "status": "online",
                 "service": "Synapse Handoff MCP Server",
                 "transport": "streamable-http",
-                "protocol": "2024-11-05"
+                "protocol": "2024-11-05",
+                "version": "2.0.0-multi-tenant"
             }).encode("utf-8")
             self.send_response(200)
             self._send_cors_headers()
@@ -265,11 +267,11 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             tool_args = params.get("arguments", {})
             try:
                 if tool_name == "ler_fila":
-                    tool_output = execute_ler_fila(tool_args)
+                    tool_output = execute_ler_fila(tool_args, tenant_id)
                 elif tool_name == "enviar_mensagem":
-                    tool_output = execute_enviar_mensagem(tool_args)
+                    tool_output = execute_enviar_mensagem(tool_args, tenant_id)
                 elif tool_name == "atualizar_status":
-                    tool_output = execute_atualizar_status(tool_args)
+                    tool_output = execute_atualizar_status(tool_args, tenant_id)
                 else:
                     raise ValueError(f"Ferramenta desconhecida: {tool_name}")
 
