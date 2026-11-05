@@ -152,6 +152,8 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
+        if not data:
+            return {"status": "ERRO_NAO_ENCONTRADO_OU_TENANT_INVALIDO", "erro": f"Tarefa {tarefa_id} nao encontrada para o tenant {tenant_id}"}
         return {"status": "ATUALIZADO_COM_SUCESSO", "registro": data}
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
