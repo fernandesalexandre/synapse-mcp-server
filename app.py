@@ -228,7 +228,16 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def _extract_tenant_id(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        tenant = qs.get('tenant_id', [None])[0] or qs.get('tenant', [None])[0]
+        if not tenant:
+            tenant = self.headers.get('X-Synapse-Tenant-Key') or self.headers.get('X-Tenant-Id')
+        return tenant or '00000000-0000-0000-0000-000000000001'
+
     def do_POST(self):
+        tenant_id = self._extract_tenant_id()
         length = int(self.headers.get("Content-Length", 0))
         raw_body = self.rfile.read(length).decode("utf-8")
         try:
