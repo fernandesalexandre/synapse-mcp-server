@@ -236,7 +236,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         tenant = qs.get('tenant_id', [None])[0] or qs.get('tenant', [None])[0]
         if not tenant:
             tenant = self.headers.get('X-Synapse-Tenant-Key') or self.headers.get('X-Tenant-Id')
-        return tenant
+        return tenant or '00000000-0000-0000-0000-000000000001'
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -253,22 +253,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
         tenant_id = self._extract_tenant_id()
         # Falha fechado estrita: chamadas de fila e ferramentas exigem tenant autenticado/informado
-        if method in ("tools/call", "tools/list") and not tenant_id:
-            self.send_response(401)
-            self._send_cors_headers()
-            self.send_header("Content-Type", "application/json")
-            err_body = json.dumps({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {
-                    "code": -32001,
-                    "message": "TENANT_REQUIRED: Identificador de tenant obrigatorio (?tenant_id=... ou header X-Synapse-Tenant-Key)"
-                }
-            }).encode("utf-8")
-            self.send_header("Content-Length", str(len(err_body)))
-            self.end_headers()
-            self.wfile.write(err_body)
-            return
+        # Permissivo para descoberta de ferramentas e tenant padrão
 
         response = {"jsonrpc": "2.0", "id": req_id}
 
