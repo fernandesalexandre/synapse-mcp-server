@@ -183,6 +183,23 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 pass
             return
 
+        if self.path == "/download/SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.6.zip":
+            file_path = os.path.join(os.path.dirname(__file__), "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.6.zip")
+            if os.path.exists(file_path):
+                self.send_response(200)
+                self._send_cors_headers()
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.6.zip"')
+                self.send_header("Content-Length", str(os.path.getsize(file_path)))
+                self.end_headers()
+                with open(file_path, "rb") as f_in:
+                    while chunk := f_in.read(65536):
+                        self.wfile.write(chunk)
+                return
+            else:
+                self.send_error(404, "File not found")
+                return
+
         if self.path == "/download/setup_synapse_commercial_v3.2.0.exe":
             file_path = os.path.join(os.path.dirname(__file__), "setup_synapse_commercial_v3.2.0.exe")
             if os.path.exists(file_path):
