@@ -159,8 +159,9 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
 class MCPRequestHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Expose-Headers", "*")
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -168,6 +169,20 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path.startswith("/sse") or "text/event-stream" in self.headers.get("Accept", ""):
+            self.send_response(200)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                self.wfile.write(b"event: endpoint\r\ndata: /mcp\r\n\r\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            return
+
         if self.path in ("/", "/mcp", "/health"):
             body = json.dumps({
                 "status": "online",
