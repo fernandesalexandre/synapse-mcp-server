@@ -184,19 +184,30 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return
 
         if self.path.startswith("/download/"):
-            fname = self.path[len("/download/"):]
-            if fname in ("latest.exe", "setup_synapse_commercial_latest.exe"):
-                fname = "setup_synapse_commercial_v3.2.2.exe"
-            elif fname in ("latest.zip", "extension_latest.zip"):
-                fname = "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip"
-            
-            file_path = os.path.join(os.path.dirname(__file__), fname)
+            fname = self.path[len("/download/"):].split("?")[0]
+            ALLOWED_FILES = {
+                "latest.exe": "setup_synapse_commercial_v3.2.2.exe",
+                "setup_synapse_commercial_latest.exe": "setup_synapse_commercial_v3.2.2.exe",
+                "setup_synapse_commercial_v3.2.0.exe": "setup_synapse_commercial_v3.2.0.exe",
+                "setup_synapse_commercial_v3.2.1.exe": "setup_synapse_commercial_v3.2.1.exe",
+                "setup_synapse_commercial_v3.2.2.exe": "setup_synapse_commercial_v3.2.2.exe",
+                "latest.zip": "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip",
+                "extension_latest.zip": "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip",
+                "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.6.zip": "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.6.zip",
+                "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip": "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip"
+            }
+            target_file = ALLOWED_FILES.get(fname)
+            if not target_file:
+                self.send_error(404, "File not allowed or not found")
+                return
+
+            file_path = os.path.join(os.path.dirname(__file__), target_file)
             if os.path.exists(file_path):
                 self.send_response(200)
                 self._send_cors_headers()
-                mime = "application/zip" if fname.endswith(".zip") else "application/octet-stream"
+                mime = "application/zip" if target_file.endswith(".zip") else "application/octet-stream"
                 self.send_header("Content-Type", mime)
-                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                self.send_header("Content-Disposition", f'attachment; filename="{target_file}"')
                 self.send_header("Content-Length", str(os.path.getsize(file_path)))
                 self.end_headers()
                 with open(file_path, "rb") as f_in:
@@ -204,7 +215,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                 return
             else:
-                self.send_error(404, f"File not found: {fname}")
+                self.send_error(404, f"File not found: {target_file}")
                 return
 
         if self.path in ("/", "/mcp", "/health"):
