@@ -5,6 +5,10 @@ Expondo as 3 ferramentas oficiais solicitadas pela Alita e Plugin Creator:
 - ler_fila
 - enviar_mensagem
 - atualizar_status
+E suporte completo a MCP Events (Webhooks oficiais para ChatGPT/OpenAI):
+- events/list
+- events/subscribe
+- events/unsubscribe
 Conecta-se à API Supabase do Handoff (dopomsklkovcvxthtyqq.supabase.co).
 """
 
@@ -12,9 +16,14 @@ import sys
 import json
 import urllib.request
 import urllib.parse
+import os
+import time
+import uuid
+import hmac
+import hashlib
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import os
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://dopomsklkovcvxthtyqq.supabase.co/rest/v1")
 API_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRvcG9tc2tsa292Y3Z4dGh0eXFxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTExMjYzNiwiZXhwIjoyMDk2Njg4NjM2fQ.DUUhJiZqpd279H8-L2fcz4dNTEjJgcSaThoWMaJKXUc")
 
@@ -78,6 +87,40 @@ TOOLS_SCHEMA = [
     }
 ]
 
+EVENTS_SCHEMA = [
+    {
+        "name": "handoff.message_created",
+        "description": "Triggered when a new Handoff directive or message arrives for Alita/ChatGPT in the queue.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_queue": {
+                    "type": "string",
+                    "description": "Queue to listen to (default: WAITING_ALITA)"
+                }
+            }
+        }
+    }
+]
+
+SUBSCRIPTIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_subscriptions.json")
+
+def load_subscriptions():
+    if os.path.exists(SUBSCRIPTIONS_FILE):
+        try:
+            with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_subscriptions(subs):
+    try:
+        with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(subs, f, indent=2)
+    except Exception as e:
+        print(f"[SUBSCRIPTIONS] Error saving: {e}", flush=True)
+
 def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"):
     target_queue = arguments.get("target_queue", "WAITING_ALITA")
     limit = int(arguments.get("limit", 5))
@@ -96,30 +139,36 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
     mensagem = arguments.get("mensagem", "")
     tarefa_origem_id = arguments.get("tarefa_origem_id")
 
-    # Roteamento estrito conforme RFC-001 v2.0 (ALITA -> DESTINO)
     if any(k in destinatario for k in ["ATLAS", "CODEX"]):
-        header = "ALITA -> ATLAS | "
+        target_queue = "WAITING_ANTIGRAVITY"
+        remetente = "ALITA"
+        prefix = "ALITA -> ATLAS"
     elif any(k in destinatario for k in ["NIKOLA", "PC2"]):
-        header = "ALITA -> NIKOLA | "
-    elif "AMBOS" in destinatario or "TODOS" in destinatario:
-        header = "ALITA -> AMBOS | "
+        target_queue = "WAITING_ANTIGRAVITY"
+        remetente = "ALITA"
+        prefix = "ALITA -> NIKOLA (PC2)"
     else:
-        header = "ALITA -> ISAAC | "
+        target_queue = "WAITING_ANTIGRAVITY"
+        remetente = "ALITA"
+        prefix = "ALITA -> ISAAC"
 
-    payload_body = {
-        "remetente": "ALITA",
-        "target_queue": "WAITING_ANTIGRAVITY",
-        "tenant_id": tenant_id,
-        "payload": f"{header}{mensagem}",
-        "status": "WAITING_ANTIGRAVITY"
+    payload_text = f"{prefix} | {mensagem}" if not mensagem.startswith("ALITA ->") else mensagem
+
+    body = {
+        "remetente": remetente,
+        "payload": payload_text,
+        "status": target_queue,
+        "target_queue": target_queue,
+        "tenant_id": tenant_id
     }
     if tarefa_origem_id:
-        payload_body["reply_to_id"] = tarefa_origem_id
+        body["reply_to_id"] = tarefa_origem_id
 
     url = f"{SUPABASE_URL}/zuler_ai_handoff_poc"
+    data_bytes = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
-        data=json.dumps(payload_body).encode("utf-8"),
+        data=data_bytes,
         headers={
             "apikey": API_KEY,
             "Authorization": f"Bearer {API_KEY}",
@@ -129,19 +178,22 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
         method="POST"
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        return {"status": "ENVIADO_COM_SUCESSO", "registro": data}
+        res = json.loads(resp.read().decode("utf-8"))
+        return {"status": "ENVIADO_COM_SUCESSO", "registro": res}
 
 def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-000000000001"):
     tarefa_id = arguments.get("tarefa_id")
-    novo_status = arguments.get("novo_status")
+    novo_status = arguments.get("novo_status", "COMPLETED").strip().upper()
 
-    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
-    payload_body = {"status": novo_status}
+    if not tarefa_id:
+        raise ValueError("tarefa_id e obrigatorio")
 
+    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{tarefa_id}&tenant_id=eq.{tenant_id}"
+    body = {"status": novo_status}
+    data_bytes = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
-        data=json.dumps(payload_body).encode("utf-8"),
+        data=data_bytes,
         headers={
             "apikey": API_KEY,
             "Authorization": f"Bearer {API_KEY}",
@@ -213,7 +265,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 "service": "Synapse Handoff MCP Server",
                 "transport": "streamable-http",
                 "protocol": "2024-11-05",
-                "version": "2.0.0-multi-tenant"
+                "version": "2.1.0-events"
             }).encode("utf-8")
             self.send_response(200)
             self._send_cors_headers()
@@ -223,7 +275,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path in ("/api/wake_alita", "/api/handoff/poll_alita"):
             try:
-                url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?target_queue=eq.WAITING_ALITA&status=eq.WAITING_ALITA&order=created_at.desc&limit=3"
+                url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?target_queue=in.(WAITING_ALITA,WAITING_CHATGPT)&status=in.(WAITING_ALITA,WAITING_CHATGPT)&order=created_at.desc&limit=5"
                 req = urllib.request.Request(url, headers={
                     "apikey": API_KEY,
                     "Authorization": f"Bearer {API_KEY}",
@@ -291,24 +343,21 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         print(f"[MCP INCOMING] method={method}, id={req_id}, params_keys={list(params.keys())}", flush=True)
 
         tenant_id = self._extract_tenant_id()
-        # Falha fechado estrita: chamadas de fila e ferramentas exigem tenant autenticado/informado
-        # Permissivo para descoberta de ferramentas e tenant padrão
-
         response = {"jsonrpc": "2.0", "id": req_id}
 
         if method == "initialize":
             response["result"] = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
-                    "tools": {"listChanged": False}
+                    "tools": {"listChanged": False},
+                    "events": {}
                 },
                 "serverInfo": {
                     "name": "synapse-handoff-mcp",
-                    "version": "1.0.0"
+                    "version": "2.1.0-events"
                 }
             }
         elif method == "notifications/initialized":
-            # Notificação unilateral MCP - sem resposta necessária
             self.send_response(204)
             self._send_cors_headers()
             self.end_headers()
@@ -347,6 +396,39 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     ],
                     "isError": True
                 }
+        elif method == "events/list":
+            response["result"] = {"events": EVENTS_SCHEMA}
+        elif method == "events/subscribe":
+            event_name = params.get("name")
+            callback_url = params.get("url")
+            secret = params.get("secret", "")
+            filter_params = params.get("filter", {})
+            if not callback_url:
+                response["error"] = {"code": -32602, "message": "Missing required callback url"}
+            else:
+                subs = load_subscriptions()
+                subs = [s for s in subs if s.get("url") != callback_url]
+                sub_id = str(uuid.uuid4())
+                subs.append({
+                    "id": sub_id,
+                    "name": event_name or "handoff.message_created",
+                    "url": callback_url,
+                    "secret": secret,
+                    "filter": filter_params,
+                    "tenant_id": tenant_id,
+                    "created_at": time.time()
+                })
+                save_subscriptions(subs)
+                print(f"[MCP EVENTS] Novo assinante registrado: {callback_url} (id={sub_id})", flush=True)
+                response["result"] = {"status": "subscribed", "subscriptionId": sub_id}
+        elif method == "events/unsubscribe":
+            sub_id = params.get("subscriptionId") or params.get("id")
+            callback_url = params.get("url")
+            subs = load_subscriptions()
+            subs = [s for s in subs if s.get("id") != sub_id and s.get("url") != callback_url]
+            save_subscriptions(subs)
+            print(f"[MCP EVENTS] Assinatura removida: id={sub_id}, url={callback_url}", flush=True)
+            response["result"] = {"status": "unsubscribed"}
         elif method == "ping":
             response["result"] = {}
         else:
@@ -363,12 +445,79 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body_bytes)
 
+def background_event_dispatcher():
+    """Worker de segundo plano para inspecionar Supabase e entregar webhooks aos assinantes do ChatGPT."""
+    print("[EVENT_DISPATCHER] Iniciado worker de notificacoes de eventos MCP...", flush=True)
+    seen_ids = set()
+    while True:
+        try:
+            subs = load_subscriptions()
+            if subs:
+                url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?target_queue=in.(WAITING_ALITA,WAITING_CHATGPT)&status=in.(WAITING_ALITA,WAITING_CHATGPT)&order=created_at.desc&limit=5"
+                req = urllib.request.Request(url, headers={
+                    "apikey": API_KEY,
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Accept": "application/json"
+                })
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    rows = json.loads(resp.read().decode("utf-8"))
+                    for row in rows:
+                        row_id = row.get("id")
+                        if not row_id or row_id in seen_ids:
+                            continue
+
+                        for sub in subs:
+                            cb_url = sub.get("url")
+                            secret = sub.get("secret", "")
+                            sub_tenant = sub.get("tenant_id")
+                            row_tenant = row.get("tenant_id")
+                            if sub_tenant and row_tenant and sub_tenant != row_tenant:
+                                continue
+
+                            payload = {
+                                "event": "handoff.message_created",
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "data": {
+                                    "id": row_id,
+                                    "remetente": row.get("remetente"),
+                                    "target_queue": row.get("target_queue"),
+                                    "created_at": row.get("created_at"),
+                                    "summary": f"Nova diretriz recebida de {row.get('remetente')} no Handoff",
+                                    "instruction": "Execute a ferramenta ler_fila para obter os detalhes completos e responder via enviar_mensagem."
+                                }
+                            }
+                            body_bytes = json.dumps(payload).encode("utf-8")
+                            headers = {
+                                "Content-Type": "application/json",
+                                "User-Agent": "Synapse-MCP-Events/1.0"
+                            }
+                            if secret:
+                                h = hmac.new(secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
+                                headers["webhook-signature"] = f"v1={h}"
+
+                            try:
+                                post_req = urllib.request.Request(cb_url, data=body_bytes, headers=headers, method="POST")
+                                with urllib.request.urlopen(post_req, timeout=8) as cb_resp:
+                                    print(f"[EVENT_DISPATCHER] Webhook entregue para {cb_url}: status={cb_resp.status}", flush=True)
+                            except Exception as err:
+                                print(f"[EVENT_DISPATCHER] Erro ao enviar webhook para {cb_url}: {err}", flush=True)
+
+                        seen_ids.add(row_id)
+        except Exception:
+            pass
+        time.sleep(3)
+
 def run(port=8001):
+    # Iniciar despachante de eventos em background
+    dispatcher_thread = threading.Thread(target=background_event_dispatcher, daemon=True)
+    dispatcher_thread.start()
+
     server = HTTPServer(("0.0.0.0", port), MCPRequestHandler)
     print(f"=================================================================")
-    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE")
+    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE (v2.1.0-events)")
     print(f" Porta: {port}")
-    print(f" Endpoints: POST / ou /mcp (streamable-http JSON-RPC 2.0)")
+    print(f" Suporte a: Tools (ler_fila, enviar_mensagem, atualizar_status)")
+    print(f" Suporte a: Events (events/list, events/subscribe, events/unsubscribe)")
     print(f"=================================================================")
     server.serve_forever()
 
