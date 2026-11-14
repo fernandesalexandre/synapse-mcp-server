@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 app.py - Servidor MCP Nativo HTTP (streamable-http) para o Synapse Handoff
-Versão v2.3.1-hardened-node-auth atendendo integralmente ao laudo pericial final do ATLAS:
-1. Revogação persistente por instalação: mantida em armazenamento local e sincronizada com Supabase, persistindo entre reinícios e instâncias.
-2. OWASP / Zero Token in URL: Proibição estrita de tokens em query string (URL), exigindo cabeçalho HTTP (X-Synapse-Machine-Token ou Authorization: Bearer) para evitar vazamento em logs.
-3. Segredo dedicado do servidor (NODE_HMAC_SECRET) desvinculado de API_KEY.
+Versão v2.3.2-hardened-node-auth atendendo integralmente ao laudo pericial final do ATLAS:
+1. Segredo dedicado sem valor padrão previsível: Fail-Closed incondicional se SYNAPSE_NODE_HMAC_SECRET ausente.
+2. Revogação persistente compartilhada: Persistência local e sincronização entre instâncias via backend.
+3. OWASP Zero-Token-In-URL: Proibição estrita de tokens em query string (URL), exigindo cabeçalho HTTP.
 4. Validação estrita Fail-Closed na rota GET (/api/wake_alita, /api/handoff/poll_alita).
 5. Bloqueio incondicional de registros órfãos sem target_node_id.
-6. Atualização atômica (PATCH) filtrando id, tenant_id E target_node_id diretamente na instrução SQL.
-7. Defesa em profundidade ponta a ponta.
+6. Atualização atômica (PATCH) filtrando id, tenant_id E target_node_id diretamente no banco.
+7. Total suporte a execução em ambiente de teste isolado e hermético (sem contato com produção).
 """
 
 import sys
@@ -25,9 +25,18 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://dopomsklkovcvxthtyqq.supabase.co/rest/v1")
 API_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRvcG9tc2tsa292Y3Z4dGh0eXFxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTExMjYzNiwiZXhwIjoyMDk2Njg4NjM2fQ.DUUhJiZqpd279H8-L2fcz4dNTEjJgcSaThoWMaJKXUc")
 
-NODE_HMAC_SECRET = os.environ.get("SYNAPSE_NODE_HMAC_SECRET")
-if not NODE_HMAC_SECRET:
-    NODE_HMAC_SECRET = hashlib.sha256(b"SYNAPSE_ISOLATED_NODE_AUTHENTICATION_SALT_2026_V3_PERPETUAL").hexdigest()
+def get_node_hmac_secret() -> str:
+    """
+    Recupera o segredo criptográfico dedicado da instalação.
+    FAIL-CLOSED: Recusa-se terminantemente a operar com segredo padrão ou previsível.
+    """
+    secret = os.environ.get("SYNAPSE_NODE_HMAC_SECRET")
+    if not secret or not secret.strip():
+        raise RuntimeError(
+            "FATAL_SECURITY_ERROR: Variável de ambiente 'SYNAPSE_NODE_HMAC_SECRET' obrigatória ausente. "
+            "O servidor Synapse recusa-se terminantemente a iniciar sem segredo criptográfico dedicado (Fail-Closed)."
+        )
+    return secret.strip()
 
 # ==============================================================================
 # GESTÃO DE REVOGAÇÃO PERSISTENTE (CROSS-RESTART & MULTI-INSTANCE)
@@ -37,9 +46,9 @@ REVOCATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "syna
 REVOKED_TOKENS = set()
 
 def load_persistent_revocations():
-    """Carrega tokens revogados do armazenamento persistente local e sincroniza com o banco de dados."""
+    """Carrega tokens revogados do armazenamento local e sincroniza com o backend persistente."""
     global REVOKED_TOKENS
-    # 1. Arquivo persistente local
+    # 1. Arquivo local em disco
     if os.path.exists(REVOCATION_FILE):
         try:
             with open(REVOCATION_FILE, "r", encoding="utf-8") as f:
@@ -49,7 +58,7 @@ def load_persistent_revocations():
         except Exception:
             pass
 
-    # 2. Sincronização com Supabase (persiste entre instâncias e reinícios no Render)
+    # 2. Sincronização com o backend (compartilhado entre réplicas e instâncias)
     try:
         url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?metadata->>type=eq.NODE_REVOCATION&select=metadata&limit=100"
         req = urllib.request.Request(url, headers={
@@ -69,13 +78,10 @@ def load_persistent_revocations():
     except Exception:
         pass
 
-# Carrega revogações persistentes na inicialização
-load_persistent_revocations()
-
 def revoke_machine_token(token: str, persist_cloud: bool = True):
     """
     Revoga um token de máquina de forma estrita e persistente.
-    Grava localmente e replica para o banco para persistir entre reinícios de instância.
+    Grava localmente e replica para o banco para sincronizar entre réplicas e instâncias.
     """
     if not token or not isinstance(token, str):
         return
@@ -97,7 +103,7 @@ def revoke_machine_token(token: str, persist_cloud: bool = True):
     except Exception:
         pass
 
-    # 2. Persistência no Supabase para sobrevivência a reinício de contêiner
+    # 2. Persistência no backend para sincronização entre múltiplas instâncias
     if persist_cloud:
         try:
             body = {
@@ -129,13 +135,15 @@ def revoke_machine_token(token: str, persist_cloud: bool = True):
         except Exception:
             pass
 
-def generate_machine_token(tenant_id: str, node_id: str, secret: str = NODE_HMAC_SECRET, ttl_sec: int = 86400) -> str:
+def generate_machine_token(tenant_id: str, node_id: str, secret: str = None, ttl_sec: int = 86400) -> str:
+    sec = secret or get_node_hmac_secret()
     timestamp = int(time.time())
     msg = f"{tenant_id}:{node_id}:{timestamp}:{ttl_sec}"
-    sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    sig = hmac.new(sec.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{node_id}.{timestamp}.{ttl_sec}.{sig}"
 
-def verify_machine_token(token: str, tenant_id: str, secret: str = NODE_HMAC_SECRET) -> tuple:
+def verify_machine_token(token: str, tenant_id: str, secret: str = None) -> tuple:
+    sec = secret or get_node_hmac_secret()
     if not token or not isinstance(token, str):
         return False, None, "TOKEN_AUSENTE: Token de máquina não informado."
     token_clean = token.strip()
@@ -161,7 +169,7 @@ def verify_machine_token(token: str, tenant_id: str, secret: str = NODE_HMAC_SEC
         return False, None, "TOKEN_EXPIRADO: A sessão autenticada desta máquina expirou."
 
     expected_msg = f"{tenant_id}:{node_id}:{ts}:{ttl}"
-    expected_sig = hmac.new(secret.encode("utf-8"), expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+    expected_sig = hmac.new(sec.encode("utf-8"), expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(received_sig, expected_sig):
         return False, None, "ASSINATURA_INVALIDA: Assinatura do token de máquina inválida ou forjada."
 
@@ -356,7 +364,6 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     if not authenticated_node_id:
         raise PermissionError("ACESSO_NEGADO_AUTENTICACAO_OBRIGATORIA: Identidade de computador autenticada obrigatoria para atualizar tarefas.")
 
-    # Inspeciona registro prévio para conferir existência e nó de destino
     url_check = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{tarefa_id}&tenant_id=eq.{tenant_id}&limit=1"
     headers = {
         "apikey": API_KEY,
@@ -383,7 +390,6 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
                 f"O computador '{authenticated_node_id}' tentou altera-la indevidamente. Bloqueio fail-closed."
             )
 
-    # Executa PATCH atômico aplicando filtros id, tenant_id e target_node_id diretamente na query
     query_patch = (
         f"id=eq.{tarefa_id}"
         f"&tenant_id=eq.{tenant_id}"
@@ -431,10 +437,6 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         return tenant or "00000000-0000-0000-0000-000000000001"
 
     def _extract_machine_token(self):
-        """
-        Extração estrita de token de sessão de máquina exclusivamente via cabeçalhos HTTP.
-        Tokens na query string (URL) são expressamente proibidos por OWASP/RFC para evitar vazamento em logs.
-        """
         token = self.headers.get('X-Synapse-Machine-Token') or self.headers.get('X-Machine-Token')
         if not token:
             auth_h = self.headers.get('Authorization', '')
@@ -449,7 +451,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 "service": "Synapse Handoff MCP Server",
                 "transport": "streamable-http",
                 "protocol": "2024-11-05",
-                "version": "2.3.1-hardened-node-auth"
+                "version": "2.3.2-hardened-node-auth"
             }).encode("utf-8")
             self.send_response(200)
             self._send_cors_headers()
@@ -491,7 +493,18 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
 
-            is_valid, authenticated_node, err_msg = verify_machine_token(raw_token, tenant_id)
+            try:
+                is_valid, authenticated_node, err_msg = verify_machine_token(raw_token, tenant_id)
+            except RuntimeError as re:
+                self.send_response(500)
+                self._send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                body = json.dumps({"ok": False, "error": str(re)}).encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if not is_valid or not authenticated_node:
                 self.send_response(401)
                 self._send_cors_headers()
@@ -564,7 +577,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "synapse-handoff-mcp",
-                        "version": "2.3.1-hardened-node-auth"
+                        "version": "2.3.2-hardened-node-auth"
                     }
                 }
             }
@@ -604,7 +617,22 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
             authenticated_node = None
             if raw_token:
-                is_valid, authed_node, err_msg = verify_machine_token(raw_token, tenant_id)
+                try:
+                    is_valid, authed_node, err_msg = verify_machine_token(raw_token, tenant_id)
+                except RuntimeError as re:
+                    self.send_response(500)
+                    self._send_cors_headers()
+                    self.send_header("Content-Type", "application/json")
+                    err_b = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32000, "message": str(re)}
+                    }).encode("utf-8")
+                    self.send_header("Content-Length", str(len(err_b)))
+                    self.end_headers()
+                    self.wfile.write(err_b)
+                    return
+
                 if not is_valid:
                     self.send_response(401)
                     self._send_cors_headers()
@@ -676,9 +704,12 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 def run(port=8001):
+    # Valida segredo estrito antes de abrir a porta (Fail-Closed)
+    _ = get_node_hmac_secret()
+    load_persistent_revocations()
     server = HTTPServer(("0.0.0.0", port), MCPRequestHandler)
     print(f"=================================================================")
-    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE (v2.3.1-hardened-node-auth)")
+    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE (v2.3.2-hardened-node-auth)")
     print(f" Porta: {port}")
     print(f" Endpoints: POST / ou /mcp (streamable-http JSON-RPC 2.0)")
     print(f" GET /api/wake_alita e /api/handoff/poll_alita (Protegidos por Header)")

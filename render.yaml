@@ -6,3 +6,6 @@ services:
     startCommand: "python app.py"
     plan: free
     region: oregon
+    envVars:
+      - key: SYNAPSE_NODE_HMAC_SECRET
+        generateValue: true
