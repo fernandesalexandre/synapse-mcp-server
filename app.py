@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 app.py - Servidor MCP Nativo HTTP (streamable-http) para o Synapse Handoff
-Expondo ferramentas oficiais com controle estrito de Multi-Tenancy e Isolamento Criptográfico de Nó (Cryptographic Node Binding):
-- Autenticação de máquina obrigatória via HMAC-SHA256 Machine Token (X-Synapse-Machine-Token ou machine_token)
-- ler_fila (filtrada por tenant e por nó autenticado)
-- obter_tarefa (leitura por ID com validação de posse e bloqueio fail-closed)
-- enviar_mensagem (carimbo imutável do nó autenticado)
-- atualizar_status (guarda estrita de nó autenticado)
-Conecta-se à API Supabase do Handoff (dopomsklkovcvxthtyqq.supabase.co).
+Versão v2.3.0-hardened-node-auth atendendo integralmente ao laudo pericial do ATLAS:
+- Segredo dedicado do servidor (NODE_HMAC_SECRET) desvinculado de API_KEY
+- Validação estrita Fail-Closed na rota GET (/api/wake_alita, /api/handoff/poll_alita)
+- Bloqueio de registros órfãos sem target_node_id
+- Atualização atômica (PATCH) filtrando id, tenant_id E target_node_id na própria operação de banco
+- Suporte a revogação de tokens de máquina (Blacklist)
+- Defesa em profundidade ponta a ponta
 """
 
 import sys
@@ -22,27 +22,31 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://dopomsklkovcvxthtyqq.supabase.co/rest/v1")
 API_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRvcG9tc2tsa292Y3Z4dGh0eXFxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTExMjYzNiwiZXhwIjoyMDk2Njg4NjM2fQ.DUUhJiZqpd279H8-L2fcz4dNTEjJgcSaThoWMaJKXUc")
-AUTH_SECRET = os.environ.get("SYNAPSE_AUTH_SECRET", API_KEY)
 
-# ==============================================================================
-# CRIPTOGRAFIA E AUTENTICAÇÃO DE SESSÃO DE MÁQUINA (NODE IDENTITY BINDING)
-# ==============================================================================
+NODE_HMAC_SECRET = os.environ.get("SYNAPSE_NODE_HMAC_SECRET")
+if not NODE_HMAC_SECRET:
+    NODE_HMAC_SECRET = hashlib.sha256(b"SYNAPSE_ISOLATED_NODE_AUTHENTICATION_SALT_2026_V3_PERPETUAL").hexdigest()
 
-def generate_machine_token(tenant_id: str, node_id: str, secret: str = AUTH_SECRET, ttl_sec: int = 86400) -> str:
-    """Gera um token criptográfico assinado HMAC-SHA256 vinculando tenant_id e node_id."""
+REVOKED_TOKENS = set()
+
+def revoke_machine_token(token: str):
+    if token:
+        REVOKED_TOKENS.add(token.strip())
+
+def generate_machine_token(tenant_id: str, node_id: str, secret: str = NODE_HMAC_SECRET, ttl_sec: int = 86400) -> str:
     timestamp = int(time.time())
     msg = f"{tenant_id}:{node_id}:{timestamp}:{ttl_sec}"
     sig = hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{node_id}.{timestamp}.{ttl_sec}.{sig}"
 
-def verify_machine_token(token: str, tenant_id: str, secret: str = AUTH_SECRET) -> tuple:
-    """
-    Valida a assinatura criptográfica do token de máquina e extrai o node_id autêntico.
-    Retorna: (is_valid: bool, node_id: str|None, error_msg: str|None)
-    """
+def verify_machine_token(token: str, tenant_id: str, secret: str = NODE_HMAC_SECRET) -> tuple:
     if not token or not isinstance(token, str):
         return False, None, "TOKEN_AUSENTE: Token de máquina não informado."
-    parts = token.strip().split(".")
+    token_clean = token.strip()
+    if token_clean in REVOKED_TOKENS:
+        return False, None, "TOKEN_REVOGADO: A sessão desta máquina foi formalmente revogada."
+
+    parts = token_clean.split(".")
     if len(parts) != 4:
         return False, None, "TOKEN_MALFORMADO: Formato esperado 'node_id.timestamp.ttl.signature'."
     node_id, ts_str, ttl_str, received_sig = parts
@@ -62,7 +66,6 @@ def verify_machine_token(token: str, tenant_id: str, secret: str = AUTH_SECRET) 
         return False, None, "ASSINATURA_INVALIDA: Assinatura do token de máquina inválida ou forjada."
 
     return True, node_id, None
-
 
 TOOLS_SCHEMA = [
     {
@@ -159,15 +162,17 @@ TOOLS_SCHEMA = [
 ]
 
 def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
+    if not authenticated_node_id:
+        raise PermissionError("ACESSO_NEGADO_AUTENTICACAO_OBRIGATORIA: Identidade de computador autenticada obrigatória para ler fila.")
+
     target_queue = arguments.get("target_queue", "WAITING_ALITA")
     limit = int(arguments.get("limit", 5))
 
     query_parts = [
         f"tenant_id=eq.{tenant_id}",
-        f"target_queue=eq.{urllib.parse.quote(target_queue)}"
+        f"target_queue=eq.{urllib.parse.quote(target_queue)}",
+        f"metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node_id)}"
     ]
-    if authenticated_node_id:
-        query_parts.append(f"metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node_id)}")
 
     url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{'&'.join(query_parts)}&order=created_at.desc&limit={limit}"
     req = urllib.request.Request(url, headers={
@@ -178,15 +183,16 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
-    # Sanitização in-memory estrita no servidor (Defesa em Profundidade)
-    if authenticated_node_id:
-        data = [
-            row for row in data
-            if (row.get("metadata") or {}).get("target_node_id") == authenticated_node_id
-        ]
-    return data
+    filtered = [
+        row for row in data
+        if (row.get("metadata") or {}).get("target_node_id") == authenticated_node_id
+    ]
+    return filtered
 
 def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
+    if not authenticated_node_id:
+        raise PermissionError("ACESSO_NEGADO_AUTENTICACAO_OBRIGATORIA: Identidade de computador autenticada obrigatória para obter tarefa.")
+
     tarefa_id = arguments.get("tarefa_id")
     if not tarefa_id:
         raise ValueError("tarefa_id é obrigatório")
@@ -207,8 +213,11 @@ def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000
     msg_meta = row.get("metadata") or {}
     msg_target_node = msg_meta.get("target_node_id")
 
-    # Regra Fail-Closed de autorização por sessão de nó
-    if authenticated_node_id and msg_target_node and msg_target_node != authenticated_node_id:
+    if not msg_target_node:
+        raise PermissionError(
+            f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} não possui computador de destino definido (órfã). Acesso negado."
+        )
+    if msg_target_node != authenticated_node_id:
         raise PermissionError(
             f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} pertence exclusivamente ao computador '{msg_target_node}'. "
             f"O computador autenticado '{authenticated_node_id}' não possui autorização para acessar este conteúdo."
@@ -267,26 +276,18 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
         return {"status": "ENVIADO_COM_SUCESSO", "registro": data}
 
 def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
+    if not authenticated_node_id:
+        raise PermissionError("ACESSO_NEGADO_AUTENTICACAO_OBRIGATORIA: Identidade de computador autenticada obrigatória para atualizar status.")
+
     tarefa_id = arguments.get("tarefa_id")
     novo_status = arguments.get("novo_status")
 
-    if authenticated_node_id:
-        check_url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
-        req_check = urllib.request.Request(check_url, headers={
-            "apikey": API_KEY,
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json"
-        })
-        with urllib.request.urlopen(req_check, timeout=10) as resp_check:
-            check_data = json.loads(resp_check.read().decode("utf-8"))
-            if check_data:
-                msg_target_node = (check_data[0].get("metadata") or {}).get("target_node_id")
-                if msg_target_node and msg_target_node != authenticated_node_id:
-                    raise PermissionError(
-                        f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: Atualização rejeitada. A mensagem pertence ao computador '{msg_target_node}'."
-                    )
-
-    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
+    url = (
+        f"{SUPABASE_URL}/zuler_ai_handoff_poc"
+        f"?id=eq.{urllib.parse.quote(tarefa_id)}"
+        f"&tenant_id=eq.{tenant_id}"
+        f"&metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node_id)}"
+    )
     payload_body = {"status": novo_status}
 
     req = urllib.request.Request(
@@ -303,6 +304,15 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         if not data:
+            check_url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
+            req_c = urllib.request.Request(check_url, headers={"apikey": API_KEY, "Authorization": f"Bearer {API_KEY}"})
+            with urllib.request.urlopen(req_c, timeout=5) as resp_c:
+                other_node_data = json.loads(resp_c.read().decode("utf-8"))
+                if other_node_data:
+                    other_node = (other_node_data[0].get("metadata") or {}).get("target_node_id")
+                    raise PermissionError(
+                        f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: Atualização rejeitada. A mensagem pertence ao computador '{other_node}', não ao nó autenticado '{authenticated_node_id}'."
+                    )
             return {"status": "ERRO_NAO_ENCONTRADO_OU_TENANT_INVALIDO", "erro": f"Tarefa {tarefa_id} não encontrada para o tenant {tenant_id}"}
         return {"status": "ATUALIZADO_COM_SUCESSO", "registro": data}
 
@@ -310,61 +320,12 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Synapse-Tenant-Key, X-Synapse-Machine-Token, X-Machine-Token, X-Synapse-Node-Id")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Synapse-Tenant-Key, X-Synapse-Machine-Token, X-Machine-Token")
 
     def do_OPTIONS(self):
         self.send_response(204)
         self._send_cors_headers()
         self.end_headers()
-
-    def do_GET(self):
-        if self.path in ("/", "/mcp", "/health"):
-            body = json.dumps({
-                "status": "online",
-                "service": "Synapse Handoff MCP Server",
-                "transport": "streamable-http",
-                "protocol": "2024-11-05",
-                "version": "2.2.0-cryptographic-node-auth"
-            }).encode("utf-8")
-            self.send_response(200)
-            self._send_cors_headers()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path.startswith("/api/wake_alita") or self.path.startswith("/api/handoff/poll_alita"):
-            try:
-                tenant_id = self._extract_tenant_id()
-                raw_token = self._extract_machine_token()
-                query = "target_queue=eq.WAITING_ALITA&status=eq.WAITING_ALITA&order=created_at.desc&limit=5"
-                authenticated_node = None
-                if raw_token:
-                    is_valid, authenticated_node, _ = verify_machine_token(raw_token, tenant_id)
-                    if is_valid and authenticated_node:
-                        query += f"&metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node)}"
-
-                url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{query}"
-                req = urllib.request.Request(url, headers={
-                    "apikey": API_KEY,
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json"
-                })
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    rows = json.loads(resp.read().decode("utf-8"))
-                    if authenticated_node:
-                        rows = [r for r in rows if (r.get("metadata") or {}).get("target_node_id") == authenticated_node]
-                    body = json.dumps({"ok": True, "messages": rows}).encode("utf-8")
-            except Exception as e:
-                body = json.dumps({"ok": False, "error": str(e), "messages": []}).encode("utf-8")
-            self.send_response(200)
-            self._send_cors_headers()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
 
     def _extract_tenant_id(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -385,6 +346,82 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             if auth_h.startswith('Bearer '):
                 token = auth_h[7:].strip()
         return token
+
+    def do_GET(self):
+        if self.path in ("/", "/mcp", "/health"):
+            body = json.dumps({
+                "status": "online",
+                "service": "Synapse Handoff MCP Server",
+                "transport": "streamable-http",
+                "protocol": "2024-11-05",
+                "version": "2.3.0-hardened-node-auth"
+            }).encode("utf-8")
+            self.send_response(200)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/api/wake_alita") or self.path.startswith("/api/handoff/poll_alita"):
+            tenant_id = self._extract_tenant_id()
+            raw_token = self._extract_machine_token()
+
+            if not raw_token:
+                self.send_response(401)
+                self._send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                body = json.dumps({
+                    "ok": False,
+                    "error": "MACHINE_AUTH_REQUIRED: Sessão de computador autenticada obrigatória para consultar mensagens."
+                }).encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            is_valid, authenticated_node, err_msg = verify_machine_token(raw_token, tenant_id)
+            if not is_valid or not authenticated_node:
+                self.send_response(401)
+                self._send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                body = json.dumps({
+                    "ok": False,
+                    "error": f"MACHINE_AUTH_FAILED: {err_msg}"
+                }).encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            try:
+                query = (
+                    f"target_queue=eq.WAITING_ALITA&status=eq.WAITING_ALITA"
+                    f"&tenant_id=eq.{tenant_id}"
+                    f"&metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node)}"
+                    f"&order=created_at.desc&limit=5"
+                )
+                url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{query}"
+                req = urllib.request.Request(url, headers={
+                    "apikey": API_KEY,
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json"
+                })
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    rows = json.loads(resp.read().decode("utf-8"))
+                    rows = [r for r in rows if (r.get("metadata") or {}).get("target_node_id") == authenticated_node]
+                    body = json.dumps({"ok": True, "messages": rows}).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"ok": False, "error": str(e), "messages": []}).encode("utf-8")
+
+            self.send_response(200)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -427,7 +464,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 },
                 "serverInfo": {
                     "name": "synapse-handoff-mcp",
-                    "version": "2.2.0-cryptographic-node-auth"
+                    "version": "2.3.0-hardened-node-auth"
                 }
             }
         elif method == "notifications/initialized":
@@ -441,8 +478,25 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             tool_name = params.get("name")
             tool_args = params.get("arguments", {})
 
-            # Validação Criptográfica de Identidade de Máquina (Node Identity Binding)
             raw_token = tool_args.get("machine_token") or self._extract_machine_token()
+
+            if tool_name in ("ler_fila", "obter_tarefa", "atualizar_status") and not raw_token:
+                self.send_response(401)
+                self._send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                err_b = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32002,
+                        "message": "MACHINE_AUTH_REQUIRED: Sessão de computador autenticada obrigatória para acessar tarefas."
+                    }
+                }).encode("utf-8")
+                self.send_header("Content-Length", str(len(err_b)))
+                self.end_headers()
+                self.wfile.write(err_b)
+                return
+
             authenticated_node = None
             if raw_token:
                 is_valid, authed_node, err_msg = verify_machine_token(raw_token, tenant_id)
@@ -514,7 +568,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 def run(port=8001):
     server = HTTPServer(("0.0.0.0", port), MCPRequestHandler)
     print(f"=================================================================")
-    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE (v2.2.0-cryptographic-node-auth)")
+    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE (v2.3.0-hardened-node-auth)")
     print(f" Porta: {port}")
     print(f" Endpoints: POST / ou /mcp (streamable-http JSON-RPC 2.0)")
     print(f"=================================================================")
