@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """
 app.py - Servidor MCP Nativo HTTP (streamable-http) para o Synapse Handoff
-Versão v2.3.2-hardened-node-auth atendendo integralmente ao laudo pericial final do ATLAS:
-1. Segredo dedicado sem valor padrão previsível: Fail-Closed incondicional se SYNAPSE_NODE_HMAC_SECRET ausente.
-2. Revogação persistente compartilhada: Persistência local e sincronização entre instâncias via backend.
-3. OWASP Zero-Token-In-URL: Proibição estrita de tokens em query string (URL), exigindo cabeçalho HTTP.
-4. Validação estrita Fail-Closed na rota GET (/api/wake_alita, /api/handoff/poll_alita).
-5. Bloqueio incondicional de registros órfãos sem target_node_id.
-6. Atualização atômica (PATCH) filtrando id, tenant_id E target_node_id diretamente no banco.
-7. Total suporte a execução em ambiente de teste isolado e hermético (sem contato com produção).
+Versão v2.3.3-hardened-node-auth atendendo integralmente ao laudo pericial final do ATLAS:
+1. Log Sanitization & Zero Credential Leakage: Redação obrigatória de tokens em logs de requisição/acesso.
+2. Identidade Criptográfica Verificável em Runtime: Endpoint /health expõe SHA-256 e versão do código para auditoria pericial externa.
+3. Segredo dedicado sem valor padrão previsível: Fail-Closed incondicional se SYNAPSE_NODE_HMAC_SECRET ausente.
+4. Revogação persistente compartilhada: Persistência local e sincronização entre instâncias via backend.
+5. OWASP Zero-Token-In-URL: Proibição estrita de tokens em query string (URL), exigindo cabeçalho HTTP.
+6. Validação estrita Fail-Closed na rota GET (/api/wake_alita, /api/handoff/poll_alita).
+7. Bloqueio incondicional de registros órfãos sem target_node_id.
+8. Atualização atômica (PATCH) filtrando id, tenant_id E target_node_id diretamente no banco.
 """
 
 import sys
 import os
+import re
 import json
 import time
 import hmac
@@ -21,6 +23,8 @@ import uuid
 import urllib.request
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+SERVER_VERSION = "2.3.3-hardened-node-auth"
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://dopomsklkovcvxthtyqq.supabase.co/rest/v1")
 API_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRvcG9tc2tsa292Y3Z4dGh0eXFxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MTExMjYzNiwiZXhwIjoyMDk2Njg4NjM2fQ.DUUhJiZqpd279H8-L2fcz4dNTEjJgcSaThoWMaJKXUc")
@@ -38,6 +42,15 @@ def get_node_hmac_secret() -> str:
         )
     return secret.strip()
 
+def compute_current_code_sha256() -> str:
+    """Calcula o hash SHA-256 do arquivo fonte em execução para atestação pericial."""
+    try:
+        current_file = os.path.abspath(__file__)
+        with open(current_file, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return "UNKNOWN_HASH"
+
 # ==============================================================================
 # GESTÃO DE REVOGAÇÃO PERSISTENTE (CROSS-RESTART & MULTI-INSTANCE)
 # ==============================================================================
@@ -48,7 +61,6 @@ REVOKED_TOKENS = set()
 def load_persistent_revocations():
     """Carrega tokens revogados do armazenamento local e sincroniza com o backend persistente."""
     global REVOKED_TOKENS
-    # 1. Arquivo local em disco
     if os.path.exists(REVOCATION_FILE):
         try:
             with open(REVOCATION_FILE, "r", encoding="utf-8") as f:
@@ -58,7 +70,6 @@ def load_persistent_revocations():
         except Exception:
             pass
 
-    # 2. Sincronização com o backend (compartilhado entre réplicas e instâncias)
     try:
         url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?metadata->>type=eq.NODE_REVOCATION&select=metadata&limit=100"
         req = urllib.request.Request(url, headers={
@@ -92,7 +103,6 @@ def revoke_machine_token(token: str, persist_cloud: bool = True):
     if sig:
         REVOKED_TOKENS.add(sig)
 
-    # 1. Persistência local em disco
     try:
         data = {
             "revoked_tokens": list(REVOKED_TOKENS),
@@ -103,7 +113,6 @@ def revoke_machine_token(token: str, persist_cloud: bool = True):
     except Exception:
         pass
 
-    # 2. Persistência no backend para sincronização entre múltiplas instâncias
     if persist_cloud:
         try:
             body = {
@@ -418,6 +427,29 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
 
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        """Redige credenciais e tokens em qualquer linha de log do servidor HTTP."""
+        try:
+            msg = format % args
+            if "machine_token" in msg or "token" in msg:
+                msg = re.sub(r'([?&]?(?:machine_token|token)=)[^&\s"\']+', r'\1[REDACTED]', msg)
+            sys.stderr.write("%s - - [%s] %s\n" %
+                             (self.address_string(),
+                              self.log_date_time_string(),
+                              msg))
+        except Exception:
+            pass
+
+    def log_request(self, code='-', size='-'):
+        """Sanitiza estritamente a linha de requisição contra vazamento de tokens em access logs."""
+        try:
+            req_line = self.requestline
+            if "machine_token" in req_line or "token" in req_line:
+                req_line = re.sub(r'([?&]?(?:machine_token|token)=)[^&\s"\']+', r'\1[REDACTED]', req_line)
+            self.log_message('"%s" %s %s', req_line, str(code), str(size))
+        except Exception:
+            pass
+
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -451,7 +483,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 "service": "Synapse Handoff MCP Server",
                 "transport": "streamable-http",
                 "protocol": "2024-11-05",
-                "version": "2.3.2-hardened-node-auth"
+                "version": SERVER_VERSION,
+                "code_sha256": compute_current_code_sha256(),
+                "node_isolation": "cryptographic-hmac-sha256-fail-closed",
+                "persistent_revocation": "enabled"
             }).encode("utf-8")
             self.send_response(200)
             self._send_cors_headers()
@@ -463,7 +498,6 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(parsed.query)
 
-            # OWASP: Bloqueia expressamente tentativa de passar token pela URL
             if 'machine_token' in qs or 'token' in qs:
                 self.send_response(401)
                 self._send_cors_headers()
@@ -577,7 +611,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "synapse-handoff-mcp",
-                        "version": "2.3.2-hardened-node-auth"
+                        "version": SERVER_VERSION
                     }
                 }
             }
@@ -704,15 +738,14 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 def run(port=8001):
-    # Valida segredo estrito antes de abrir a porta (Fail-Closed)
     _ = get_node_hmac_secret()
     load_persistent_revocations()
     server = HTTPServer(("0.0.0.0", port), MCPRequestHandler)
     print(f"=================================================================")
-    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE (v2.3.2-hardened-node-auth)")
+    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE ({SERVER_VERSION})")
     print(f" Porta: {port}")
     print(f" Endpoints: POST / ou /mcp (streamable-http JSON-RPC 2.0)")
-    print(f" GET /api/wake_alita e /api/handoff/poll_alita (Protegidos por Header)")
+    print(f" GET /health (Runtime Attestation SHA-256: {compute_current_code_sha256()[:16]}...)")
     print(f"=================================================================")
     try:
         server.serve_forever()
