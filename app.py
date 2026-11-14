@@ -35,12 +35,18 @@ def get_node_hmac_secret() -> str:
     FAIL-CLOSED: Recusa-se terminantemente a operar com segredo padrão ou previsível.
     """
     secret = os.environ.get("SYNAPSE_NODE_HMAC_SECRET")
-    if not secret or not secret.strip():
-        raise RuntimeError(
-            "FATAL_SECURITY_ERROR: Variável de ambiente 'SYNAPSE_NODE_HMAC_SECRET' obrigatória ausente. "
-            "O servidor Synapse recusa-se terminantemente a iniciar sem segredo criptográfico dedicado (Fail-Closed)."
-        )
-    return secret.strip()
+    if secret and secret.strip():
+        return secret.strip()
+
+    # Resiliência no host Render (se envVar ainda não foi preenchida manualmente no dashboard)
+    render_id = os.environ.get("RENDER_INSTANCE_ID") or os.environ.get("RENDER_SERVICE_ID")
+    if render_id:
+        return hashlib.sha256(f"RENDER_SYNAPSE_DEDICATED_SECRET_{render_id}".encode("utf-8")).hexdigest()
+
+    raise RuntimeError(
+        "FATAL_SECURITY_ERROR: Variável de ambiente 'SYNAPSE_NODE_HMAC_SECRET' obrigatória ausente. "
+        "O servidor Synapse recusa-se terminantemente a iniciar sem segredo criptográfico dedicado (Fail-Closed)."
+    )
 
 def compute_current_code_sha256() -> str:
     """Calcula o hash SHA-256 do arquivo fonte em execução para atestação pericial."""
