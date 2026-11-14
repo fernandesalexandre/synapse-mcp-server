@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-synapse_mcp_server.py - Servidor MCP Nativo HTTP (streamable-http) para o Synapse Handoff
-Expondo as 3 ferramentas oficiais solicitadas pela Alita e Plugin Creator:
-- ler_fila
-- enviar_mensagem
-- atualizar_status
+app.py - Servidor MCP Nativo HTTP (streamable-http) para o Synapse Handoff
+Expondo ferramentas oficiais com controle estrito de Multi-Tenancy e Isolamento de Nós (Node Isolation):
+- ler_fila (filtrada por tenant e por node_id de destino)
+- obter_tarefa (leitura por ID com validação de autorização por nó)
+- enviar_mensagem (carimbo imutável de source_node_id e target_node_id)
+- atualizar_status (com guarda de posse de nó)
 Conecta-se à API Supabase do Handoff (dopomsklkovcvxthtyqq.supabase.co).
 """
 
@@ -21,13 +22,17 @@ API_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e
 TOOLS_SCHEMA = [
     {
         "name": "ler_fila",
-        "description": "Consulta tarefas e mensagens pendentes na fila do Zuler AI Handoff (Supabase).",
+        "description": "Consulta tarefas e mensagens pendentes na fila do Zuler AI Handoff (Supabase), com isolamento estrito por nó/computador.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "target_queue": {
                     "type": "string",
                     "description": "Fila a consultar (ex: WAITING_ALITA, WAITING_ANTIGRAVITY). Padrao: WAITING_ALITA"
+                },
+                "node_id": {
+                    "type": "string",
+                    "description": "Identificador único do nó/computador (ex: SYN-PC1, SYN-PC2). Quando informado, restringe o retorno estritamente às mensagens destinadas a este nó."
                 },
                 "limit": {
                     "type": "integer",
@@ -37,14 +42,32 @@ TOOLS_SCHEMA = [
         }
     },
     {
+        "name": "obter_tarefa",
+        "description": "Obtém uma tarefa específica pelo ID com verificação de autorização e barreira contra vazamento entre computadores.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tarefa_id": {
+                    "type": "string",
+                    "description": "UUID da tarefa a ser consultada"
+                },
+                "node_id": {
+                    "type": "string",
+                    "description": "Identificador do nó solicitante autenticado. Bloqueia a leitura se a tarefa pertencer a outro computador."
+                }
+            },
+            "required": ["tarefa_id"]
+        }
+    },
+    {
         "name": "enviar_mensagem",
-        "description": "Envia mensagem, ordem ou resposta de governanca da Alita para o Isaac (Antigravity) na fila do Handoff.",
+        "description": "Envia mensagem, ordem ou resposta de governanca com vinculacao de nó de origem e nó de destino.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "destinatario": {
                     "type": "string",
-                    "description": "Nome do destinatario (ex: ISAAC, ANTIGRAVITY)"
+                    "description": "Nome do destinatario (ex: ISAAC, ANTIGRAVITY, NIKOLA)"
                 },
                 "mensagem": {
                     "type": "string",
@@ -53,6 +76,14 @@ TOOLS_SCHEMA = [
                 "tarefa_origem_id": {
                     "type": "string",
                     "description": "ID da tarefa de origem se for resposta a uma tarefa existente"
+                },
+                "source_node_id": {
+                    "type": "string",
+                    "description": "Identificador do nó remetente"
+                },
+                "target_node_id": {
+                    "type": "string",
+                    "description": "Identificador do nó destinatário exclusivo"
                 }
             },
             "required": ["destinatario", "mensagem"]
@@ -60,7 +91,7 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "atualizar_status",
-        "description": "Atualiza o status de processamento de uma tarefa na fila do Handoff (ex: COMPLETED, IN_PROGRESS, FAILED).",
+        "description": "Atualiza o status de processamento de uma tarefa na fila do Handoff (ex: COMPLETED, IN_PROGRESS, FAILED) com guarda de posse de nó.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -71,6 +102,10 @@ TOOLS_SCHEMA = [
                 "novo_status": {
                     "type": "string",
                     "description": "Novo status (ex: COMPLETED, IN_PROGRESS, FAILED)"
+                },
+                "node_id": {
+                    "type": "string",
+                    "description": "Identificador do nó solicitante"
                 }
             },
             "required": ["tarefa_id", "novo_status"]
@@ -78,10 +113,19 @@ TOOLS_SCHEMA = [
     }
 ]
 
-def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"):
+def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001", node_id=None):
     target_queue = arguments.get("target_queue", "WAITING_ALITA")
     limit = int(arguments.get("limit", 5))
-    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?tenant_id=eq.{tenant_id}&target_queue=eq.{urllib.parse.quote(target_queue)}&order=created_at.desc&limit={limit}"
+    target_node = node_id or arguments.get("node_id") or arguments.get("target_node_id")
+
+    query_parts = [
+        f"tenant_id=eq.{tenant_id}",
+        f"target_queue=eq.{urllib.parse.quote(target_queue)}"
+    ]
+    if target_node:
+        query_parts.append(f"metadata->>target_node_id=eq.{urllib.parse.quote(target_node)}")
+
+    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{'&'.join(query_parts)}&order=created_at.desc&limit={limit}"
     req = urllib.request.Request(url, headers={
         "apikey": API_KEY,
         "Authorization": f"Bearer {API_KEY}",
@@ -89,12 +133,59 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
     })
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-        return data
 
-def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000000001"):
+    # Defesa em profundidade no servidor: sanitização in-memory
+    if target_node:
+        data = [
+            row for row in data
+            if (row.get("metadata") or {}).get("target_node_id") == target_node
+        ]
+    return data
+
+def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000001", node_id=None):
+    tarefa_id = arguments.get("tarefa_id")
+    target_node = node_id or arguments.get("node_id") or arguments.get("target_node_id")
+    if not tarefa_id:
+        raise ValueError("tarefa_id é obrigatório")
+
+    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
+    req = urllib.request.Request(url, headers={
+        "apikey": API_KEY,
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    })
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    if not data:
+        return {"status": "NAO_ENCONTRADO", "erro": f"Tarefa {tarefa_id} não encontrada para o tenant {tenant_id}"}
+
+    row = data[0]
+    msg_meta = row.get("metadata") or {}
+    msg_target_node = msg_meta.get("target_node_id")
+
+    # Regra estrita de autorização por nó (Server-Side Node Isolation)
+    if target_node and msg_target_node and msg_target_node != target_node:
+        raise PermissionError(
+            f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} pertence ao nó '{msg_target_node}'. "
+            f"O nó solicitante '{target_node}' não possui autorização para ler este conteúdo."
+        )
+
+    return {"status": "SUCESSO", "registro": row}
+
+def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000000001", node_id=None):
     destinatario = arguments.get("destinatario", "ISAAC").strip().upper()
     mensagem = arguments.get("mensagem", "")
     tarefa_origem_id = arguments.get("tarefa_origem_id")
+
+    source_node = node_id or arguments.get("source_node_id") or arguments.get("node_id") or "UNKNOWN_NODE"
+    target_node = arguments.get("target_node_id") or source_node
+
+    metadata = arguments.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata["source_node_id"] = source_node
+    metadata["target_node_id"] = target_node
 
     # Roteamento estrito conforme RFC-001 v2.0 (ALITA -> DESTINO)
     if any(k in destinatario for k in ["ATLAS", "CODEX"]):
@@ -110,6 +201,7 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
         "remetente": "ALITA",
         "target_queue": "WAITING_ANTIGRAVITY",
         "tenant_id": tenant_id,
+        "metadata": metadata,
         "payload": f"{header}{mensagem}",
         "status": "WAITING_ANTIGRAVITY"
     }
@@ -132,9 +224,26 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
         data = json.loads(resp.read().decode("utf-8"))
         return {"status": "ENVIADO_COM_SUCESSO", "registro": data}
 
-def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-000000000001"):
+def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-000000000001", node_id=None):
     tarefa_id = arguments.get("tarefa_id")
     novo_status = arguments.get("novo_status")
+    target_node = node_id or arguments.get("node_id") or arguments.get("target_node_id")
+
+    if target_node:
+        check_url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
+        req_check = urllib.request.Request(check_url, headers={
+            "apikey": API_KEY,
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json"
+        })
+        with urllib.request.urlopen(req_check, timeout=10) as resp_check:
+            check_data = json.loads(resp_check.read().decode("utf-8"))
+            if check_data:
+                msg_target_node = (check_data[0].get("metadata") or {}).get("target_node_id")
+                if msg_target_node and msg_target_node != target_node:
+                    raise PermissionError(
+                        f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: Atualização rejeitada. A mensagem pertence ao nó '{msg_target_node}'."
+                    )
 
     url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
     payload_body = {"status": novo_status}
@@ -153,15 +262,14 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         if not data:
-            return {"status": "ERRO_NAO_ENCONTRADO_OU_TENANT_INVALIDO", "erro": f"Tarefa {tarefa_id} nao encontrada para o tenant {tenant_id}"}
+            return {"status": "ERRO_NAO_ENCONTRADO_OU_TENANT_INVALIDO", "erro": f"Tarefa {tarefa_id} não encontrada para o tenant {tenant_id}"}
         return {"status": "ATUALIZADO_COM_SUCESSO", "registro": data}
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Expose-Headers", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Synapse-Tenant-Key, X-Synapse-Node-Id, X-Machine-Id")
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -169,62 +277,13 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path.startswith("/sse") or "text/event-stream" in self.headers.get("Accept", ""):
-            self.send_response(200)
-            self._send_cors_headers()
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            try:
-                self.wfile.write(b"event: endpoint\r\ndata: /mcp\r\n\r\n")
-                self.wfile.flush()
-            except Exception:
-                pass
-            return
-
-        if self.path.startswith("/download/"):
-            fname = self.path[len("/download/"):].split("?")[0]
-            ALLOWED_FILES = {
-                "latest.exe": "setup_synapse_commercial_v3.2.2.exe",
-                "setup_synapse_commercial_latest.exe": "setup_synapse_commercial_v3.2.2.exe",
-                "setup_synapse_commercial_v3.2.0.exe": "setup_synapse_commercial_v3.2.0.exe",
-                "setup_synapse_commercial_v3.2.1.exe": "setup_synapse_commercial_v3.2.1.exe",
-                "setup_synapse_commercial_v3.2.2.exe": "setup_synapse_commercial_v3.2.2.exe",
-                "latest.zip": "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip",
-                "extension_latest.zip": "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip",
-                "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.6.zip": "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.6.zip",
-                "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip": "SYNAPSE_WAKE_PILOT_STORE_RELEASE_v2.9.0.7.zip"
-            }
-            target_file = ALLOWED_FILES.get(fname)
-            if not target_file:
-                self.send_error(404, "File not allowed or not found")
-                return
-
-            file_path = os.path.join(os.path.dirname(__file__), target_file)
-            if os.path.exists(file_path):
-                self.send_response(200)
-                self._send_cors_headers()
-                mime = "application/zip" if target_file.endswith(".zip") else "application/octet-stream"
-                self.send_header("Content-Type", mime)
-                self.send_header("Content-Disposition", f'attachment; filename="{target_file}"')
-                self.send_header("Content-Length", str(os.path.getsize(file_path)))
-                self.end_headers()
-                with open(file_path, "rb") as f_in:
-                    while chunk := f_in.read(65536):
-                        self.wfile.write(chunk)
-                return
-            else:
-                self.send_error(404, f"File not found: {target_file}")
-                return
-
         if self.path in ("/", "/mcp", "/health"):
             body = json.dumps({
                 "status": "online",
                 "service": "Synapse Handoff MCP Server",
                 "transport": "streamable-http",
                 "protocol": "2024-11-05",
-                "version": "2.0.0-multi-tenant"
+                "version": "2.1.0-node-isolated"
             }).encode("utf-8")
             self.send_response(200)
             self._send_cors_headers()
@@ -232,9 +291,13 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path in ("/api/wake_alita", "/api/handoff/poll_alita"):
+        elif self.path.startswith("/api/wake_alita") or self.path.startswith("/api/handoff/poll_alita"):
             try:
-                url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?target_queue=eq.WAITING_ALITA&status=eq.WAITING_ALITA&order=created_at.desc&limit=3"
+                node_id = self._extract_node_id()
+                query = "target_queue=eq.WAITING_ALITA&status=eq.WAITING_ALITA&order=created_at.desc&limit=5"
+                if node_id:
+                    query += f"&metadata->>target_node_id=eq.{urllib.parse.quote(node_id)}"
+                url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{query}"
                 req = urllib.request.Request(url, headers={
                     "apikey": API_KEY,
                     "Authorization": f"Bearer {API_KEY}",
@@ -242,34 +305,11 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 })
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     rows = json.loads(resp.read().decode("utf-8"))
+                    if node_id:
+                        rows = [r for r in rows if (r.get("metadata") or {}).get("target_node_id") == node_id]
                     body = json.dumps({"ok": True, "messages": rows}).encode("utf-8")
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e), "messages": []}).encode("utf-8")
-            self.send_response(200)
-            self._send_cors_headers()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/api/freeze_turn":
-            try:
-                url = f"{SUPABASE_URL}/zuler_ai_handoff_poc"
-                payload = {
-                    "remetente": "SUPERVISOR",
-                    "payload": "ALITA <- SUPERVISOR | [ENCERRAMENTO DE TURNO] O usuário autorizou o encerramento da sessão. Por favor, consolidem o PROJETO_R9.md e congelem o estado.",
-                    "status": "WAITING_ALITA",
-                    "target_queue": "WAITING_ALITA"
-                }
-                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={
-                    "apikey": API_KEY,
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json"
-                }, method="POST")
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    pass
-                body = json.dumps({"ok": True, "status": "FREEZE_POSTED"}).encode("utf-8")
-            except Exception as e:
-                body = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
             self.send_response(200)
             self._send_cors_headers()
             self.send_header("Content-Type", "application/json")
@@ -286,7 +326,15 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         tenant = qs.get('tenant_id', [None])[0] or qs.get('tenant', [None])[0]
         if not tenant:
             tenant = self.headers.get('X-Synapse-Tenant-Key') or self.headers.get('X-Tenant-Id')
-        return tenant or '00000000-0000-0000-0000-000000000001'
+        return tenant
+
+    def _extract_node_id(self):
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        node = qs.get('node_id', [None])[0] or qs.get('machine_id', [None])[0] or qs.get('device_id', [None])[0]
+        if not node:
+            node = self.headers.get('X-Synapse-Node-Id') or self.headers.get('X-Machine-Id') or self.headers.get('X-Device-Id')
+        return node
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -299,11 +347,26 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         req_id = req_data.get("id")
         method = req_data.get("method", "")
         params = req_data.get("params", {})
-        print(f"[MCP INCOMING] method={method}, id={req_id}, params_keys={list(params.keys())}", flush=True)
 
         tenant_id = self._extract_tenant_id()
-        # Falha fechado estrita: chamadas de fila e ferramentas exigem tenant autenticado/informado
-        # Permissivo para descoberta de ferramentas e tenant padrão
+        node_id = self._extract_node_id()
+
+        if method in ("tools/call", "tools/list") and not tenant_id:
+            self.send_response(401)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            err_body = json.dumps({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32001,
+                    "message": "TENANT_REQUIRED: Identificador de tenant obrigatório (?tenant_id=... ou header X-Synapse-Tenant-Key)"
+                }
+            }).encode("utf-8")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            self.wfile.write(err_body)
+            return
 
         response = {"jsonrpc": "2.0", "id": req_id}
 
@@ -315,11 +378,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 },
                 "serverInfo": {
                     "name": "synapse-handoff-mcp",
-                    "version": "1.0.0"
+                    "version": "2.1.0-node-isolated"
                 }
             }
         elif method == "notifications/initialized":
-            # Notificação unilateral MCP - sem resposta necessária
             self.send_response(204)
             self._send_cors_headers()
             self.end_headers()
@@ -329,13 +391,16 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         elif method == "tools/call":
             tool_name = params.get("name")
             tool_args = params.get("arguments", {})
+            call_node = node_id or tool_args.get("node_id") or tool_args.get("target_node_id")
             try:
                 if tool_name == "ler_fila":
-                    tool_output = execute_ler_fila(tool_args, tenant_id)
+                    tool_output = execute_ler_fila(tool_args, tenant_id, node_id=call_node)
+                elif tool_name == "obter_tarefa":
+                    tool_output = execute_obter_tarefa(tool_args, tenant_id, node_id=call_node)
                 elif tool_name == "enviar_mensagem":
-                    tool_output = execute_enviar_mensagem(tool_args, tenant_id)
+                    tool_output = execute_enviar_mensagem(tool_args, tenant_id, node_id=call_node)
                 elif tool_name == "atualizar_status":
-                    tool_output = execute_atualizar_status(tool_args, tenant_id)
+                    tool_output = execute_atualizar_status(tool_args, tenant_id, node_id=call_node)
                 else:
                     raise ValueError(f"Ferramenta desconhecida: {tool_name}")
 
@@ -377,7 +442,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 def run(port=8001):
     server = HTTPServer(("0.0.0.0", port), MCPRequestHandler)
     print(f"=================================================================")
-    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE")
+    print(f" SYNAPSE HANDOFF MCP SERVER ONLINE (v2.1.0-node-isolated)")
     print(f" Porta: {port}")
     print(f" Endpoints: POST / ou /mcp (streamable-http JSON-RPC 2.0)")
     print(f"=================================================================")
