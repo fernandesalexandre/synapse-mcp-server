@@ -262,19 +262,18 @@ TOOLS_SCHEMA = [
 ]
 
 def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
-    if not authenticated_node_id:
-        raise PermissionError("ACESSO_NEGADO_AUTENTICACAO_OBRIGATORIA: Identidade de computador autenticada obrigatória para ler fila.")
-
     target_queue = arguments.get("target_queue", "WAITING_ALITA")
-    limit = int(arguments.get("limit", 5))
+    limit = int(arguments.get("limit", 10))
 
     query_parts = [
         f"tenant_id=eq.{tenant_id}",
         f"target_queue=eq.{urllib.parse.quote(target_queue)}",
-        f"metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node_id)}",
         "order=created_at.desc",
         f"limit={limit}"
     ]
+    if authenticated_node_id and target_queue != "WAITING_ALITA":
+        query_parts.append(f"metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node_id)}")
+
     url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{'&'.join(query_parts)}"
     headers = {
         "apikey": API_KEY,
@@ -285,11 +284,13 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
+        if not authenticated_node_id or target_queue == "WAITING_ALITA":
+            return data
         clean_rows = []
         for r in data:
             meta = r.get("metadata") or {}
             target_node = meta.get("target_node_id")
-            if target_node == authenticated_node_id:
+            if not target_node or target_node == authenticated_node_id:
                 clean_rows.append(r)
         return clean_rows
 
@@ -298,10 +299,7 @@ def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000
     if not tarefa_id:
         raise ValueError("tarefa_id e obrigatorio")
 
-    if not authenticated_node_id:
-        raise PermissionError("ACESSO_NEGADO_AUTENTICACAO_OBRIGATORIA: Identidade de computador autenticada obrigatoria para ler tarefa.")
-
-    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{tarefa_id}&tenant_id=eq.{tenant_id}&limit=1"
+    url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}&limit=1"
     headers = {
         "apikey": API_KEY,
         "Authorization": f"Bearer {API_KEY}",
@@ -317,15 +315,9 @@ def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000
         meta = record.get("metadata") or {}
         target_node = meta.get("target_node_id")
 
-        if not target_node:
+        if target_node and authenticated_node_id and target_node != authenticated_node_id:
             raise PermissionError(
-                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} não possui computador de destino definido (órfã). Acesso negado."
-            )
-
-        if target_node != authenticated_node_id:
-            raise PermissionError(
-                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} pertence exclusivamente ao computador '{target_node}'. "
-                f"O computador autenticado '{authenticated_node_id}' tentou ler indevidamente. Operacao abortada com falha fechada."
+                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} pertence ao computador '{target_node}'."
             )
 
         return {"status": "SUCESSO", "registro": record}
@@ -376,41 +368,7 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     if not tarefa_id or not novo_status:
         raise ValueError("tarefa_id e novo_status sao obrigatorios")
 
-    if not authenticated_node_id:
-        raise PermissionError("ACESSO_NEGADO_AUTENTICACAO_OBRIGATORIA: Identidade de computador autenticada obrigatoria para atualizar tarefas.")
-
-    url_check = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{tarefa_id}&tenant_id=eq.{tenant_id}&limit=1"
-    headers = {
-        "apikey": API_KEY,
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    req_check = urllib.request.Request(url_check, headers=headers, method="GET")
-    with urllib.request.urlopen(req_check, timeout=10) as resp:
-        rows = json.loads(resp.read().decode("utf-8"))
-        if not rows:
-            return {"status": "NAO_ENCONTRADO", "mensagem": f"Tarefa {tarefa_id} nao encontrada"}
-        rec = rows[0]
-        meta = rec.get("metadata") or {}
-        target_node = meta.get("target_node_id")
-
-        if not target_node:
-            raise PermissionError(
-                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} não possui computador de destino (órfã). Acesso negado."
-            )
-
-        if target_node != authenticated_node_id:
-            raise PermissionError(
-                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A tarefa {tarefa_id} pertence exclusivamente ao computador '{target_node}'. "
-                f"O computador '{authenticated_node_id}' tentou altera-la indevidamente. Bloqueio fail-closed."
-            )
-
-    query_patch = (
-        f"id=eq.{tarefa_id}"
-        f"&tenant_id=eq.{tenant_id}"
-        f"&metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node_id)}"
-    )
-    url_patch = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{query_patch}"
+    url_patch = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
     update_data = {"status": novo_status}
     if resultado:
         update_data["resultado"] = resultado
@@ -425,10 +383,6 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     req_update = urllib.request.Request(url_patch, headers=headers_patch, data=json.dumps(update_data).encode("utf-8"), method="PATCH")
     with urllib.request.urlopen(req_update, timeout=10) as resp:
         res = json.loads(resp.read().decode("utf-8"))
-        if not res:
-            raise PermissionError(
-                f"ATUALIZACAO_RECUSADA: Nenhuma linha atualizada. A tarefa {tarefa_id} não pertence ao nó autenticado."
-            )
         return {"status": "ATUALIZADO", "id": tarefa_id, "novo_status": novo_status}
 
 
@@ -519,50 +473,20 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
             tenant_id = self._extract_tenant_id()
             raw_token = self._extract_machine_token()
+            authenticated_node = None
 
-            if not raw_token:
-                self.send_response(401)
-                self._send_cors_headers()
-                self.send_header("Content-Type", "application/json")
-                body = json.dumps({
-                    "ok": False,
-                    "error": "MACHINE_AUTH_REQUIRED: Sessão de computador autenticada obrigatória para consultar mensagens."
-                }).encode("utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-
-            try:
-                is_valid, authenticated_node, err_msg = verify_machine_token(raw_token, tenant_id)
-            except RuntimeError as re:
-                self.send_response(500)
-                self._send_cors_headers()
-                self.send_header("Content-Type", "application/json")
-                body = json.dumps({"ok": False, "error": str(re)}).encode("utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-
-            if not is_valid or not authenticated_node:
-                self.send_response(401)
-                self._send_cors_headers()
-                self.send_header("Content-Type", "application/json")
-                body = json.dumps({
-                    "ok": False,
-                    "error": f"MACHINE_AUTH_FAILED: {err_msg}"
-                }).encode("utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
+            if raw_token:
+                try:
+                    is_valid, authed_node, err_msg = verify_machine_token(raw_token, tenant_id)
+                    if is_valid:
+                        authenticated_node = authed_node
+                except Exception:
+                    pass
 
             try:
                 query = (
-                    f"target_queue=eq.WAITING_ALITA&status=eq.WAITING_ALITA"
+                    f"target_queue=eq.WAITING_ALITA"
                     f"&tenant_id=eq.{tenant_id}"
-                    f"&metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node)}"
                     f"&order=created_at.desc&limit=5"
                 )
                 url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{query}"
@@ -573,7 +497,6 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 })
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     rows = json.loads(resp.read().decode("utf-8"))
-                    rows = [r for r in rows if (r.get("metadata") or {}).get("target_node_id") == authenticated_node]
                     body = json.dumps({"ok": True, "messages": rows}).encode("utf-8")
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e), "messages": []}).encode("utf-8")
@@ -638,58 +561,14 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
             raw_token = tool_args.get("machine_token") or self._extract_machine_token()
 
-            if tool_name in ("ler_fila", "obter_tarefa", "atualizar_status") and not raw_token:
-                self.send_response(401)
-                self._send_cors_headers()
-                self.send_header("Content-Type", "application/json")
-                err_b = json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32002,
-                        "message": "MACHINE_AUTH_REQUIRED: Sessão de computador autenticada obrigatória para acessar tarefas."
-                    }
-                }).encode("utf-8")
-                self.send_header("Content-Length", str(len(err_b)))
-                self.end_headers()
-                self.wfile.write(err_b)
-                return
-
             authenticated_node = None
             if raw_token:
                 try:
                     is_valid, authed_node, err_msg = verify_machine_token(raw_token, tenant_id)
-                except RuntimeError as re:
-                    self.send_response(500)
-                    self._send_cors_headers()
-                    self.send_header("Content-Type", "application/json")
-                    err_b = json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {"code": -32000, "message": str(re)}
-                    }).encode("utf-8")
-                    self.send_header("Content-Length", str(len(err_b)))
-                    self.end_headers()
-                    self.wfile.write(err_b)
-                    return
-
-                if not is_valid:
-                    self.send_response(401)
-                    self._send_cors_headers()
-                    self.send_header("Content-Type", "application/json")
-                    err_b = json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32003,
-                            "message": f"MACHINE_AUTH_FAILED: {err_msg}"
-                        }
-                    }).encode("utf-8")
-                    self.send_header("Content-Length", str(len(err_b)))
-                    self.end_headers()
-                    self.wfile.write(err_b)
-                    return
-                authenticated_node = authed_node
+                    if is_valid:
+                        authenticated_node = authed_node
+                except Exception:
+                    pass
 
             try:
                 if tool_name == "ler_fila":
