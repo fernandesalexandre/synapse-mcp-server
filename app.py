@@ -239,8 +239,8 @@ TOOLS_SCHEMA = [
                 "remetente": {"type": "string", "description": "Nome do remetente (ex: ALITA, ISAAC, NIKOLA, ATLAS)"},
                 "destinatario": {
                     "type": "string",
-                    "description": "Nome ou ID do agente destinatário explícito (ex: ISAAC, NIKOLA, ATLAS, ALITA, ALL). Obrigatório. O servidor recusa qualquer inferência por texto no corpo.",
-                    "enum": ["ISAAC", "NIKOLA", "ATLAS", "ALITA", "ALL"]
+                    "description": "Nome ou ID do agente destinatário explícito (ex: ISAAC, NIKOLA, ATLAS, CODEX, ALITA, ALL). Obrigatório. O servidor recusa qualquer inferência por texto no corpo.",
+                    "enum": ["ISAAC", "NIKOLA", "ATLAS", "CODEX", "ALITA", "ALL"]
                 },
                 "target_node_id": {"type": "string", "description": "ID do nó/computador de destino (ex: PC1, PC2, PC1_CODEX, CLOUD_OPENAI, ALL). Se omitido, é resolvido estritamente pelo cadastro do agente."},
                 "target_queue": {"type": "string", "description": "Fila de destino (padrão: WAITING_ANTIGRAVITY)"},
@@ -345,12 +345,15 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
             "Pela Diretriz Soberana L0, o payload e 100% opaco e a inferencia por analise de texto no corpo foi permanentemente desativada."
         )
 
-    # Synapse Dynamic Agent Registry oficial: mapeamento autoritativo de agentes para seus nos
+    # Canonicalização de aliases
+    if dest == "CODEX":
+        dest = "ATLAS"
+
+    # Synapse Dynamic Agent Registry oficial: mapeamento autoritativo de agentes para seus nós
     AGENT_REGISTRY = {
         "ISAAC": "PC1",
         "NIKOLA": "PC2",
         "ATLAS": "PC1_CODEX",
-        "CODEX": "PC1_CODEX",
         "ALITA": "CLOUD_OPENAI",
         "ALL": "ALL"
     }
@@ -361,13 +364,23 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
     resolved_node = AGENT_REGISTRY[dest]
     target_node = (arguments.get("target_node_id") or "").upper().strip()
 
-    if target_node and target_node != resolved_node and target_node != "ALL" and resolved_node != "ALL":
-        raise ValueError(
-            f"CONFLITO_AUTORIDADE_DESTINO: O destinatario '{dest}' pertence ao no '{resolved_node}', "
-            f"mas target_node_id informado foi '{target_node}'."
-        )
-
-    final_target_node = target_node if target_node else resolved_node
+    # Validação estrita de autoridade de destino:
+    # Destinatário privado exige estritamente o nó registrado; 'ALL' é proibido para destinatário individual.
+    if dest != "ALL":
+        if target_node and target_node != resolved_node:
+            raise ValueError(
+                f"CONFLITO_AUTORIDADE_DESTINO: O destinatario privado '{dest}' pertence exclusivamente ao no '{resolved_node}', "
+                f"mas target_node_id informado foi '{target_node}'. O no ALL e proibido para mensagens nominais privadas."
+            )
+        final_target_node = resolved_node
+    else:
+        # Destinatário broadcast
+        if target_node and target_node != "ALL":
+            raise ValueError(
+                f"CONFLITO_AUTORIDADE_DESTINO: Broadcast (destinatario='ALL') exige target_node_id='ALL', "
+                f"mas foi informado '{target_node}'."
+            )
+        final_target_node = "ALL"
 
     target_queue = arguments.get("target_queue")
     # Todas as tarefas de Alita para a equipe (Isaac, Nikola, Atlas) vão para WAITING_ANTIGRAVITY
