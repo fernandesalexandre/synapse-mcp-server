@@ -232,19 +232,23 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "enviar_mensagem",
-        "description": "Envia uma nova mensagem/diretriz para a fila do Handoff carimbando a máquina de origem e o destinatário nominal com isolamento estrito de nó.",
+        "description": "Envia uma nova mensagem/diretriz para a fila do Handoff carimbando a máquina de origem e o destinatário nominal com isolamento estrito de nó. O envelope estruturado (destinatario e target_node_id) é obrigatório e o payload é 100% opaco.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "remetente": {"type": "string", "description": "Nome do remetente"},
-                "destinatario": {"type": "string", "description": "Nome ou ID da IA destinatária (ex: ISAAC, NIKOLA, ATLAS, ALL). Se omitido, é detectado automaticamente."},
-                "target_node_id": {"type": "string", "description": "ID do computador de destino (ex: PC1, PC2, ALL)"},
+                "remetente": {"type": "string", "description": "Nome do remetente (ex: ALITA, ISAAC, NIKOLA, ATLAS)"},
+                "destinatario": {
+                    "type": "string",
+                    "description": "Nome ou ID do agente destinatário explícito (ex: ISAAC, NIKOLA, ATLAS, ALITA, ALL). Obrigatório. O servidor recusa qualquer inferência por texto no corpo.",
+                    "enum": ["ISAAC", "NIKOLA", "ATLAS", "ALITA", "ALL"]
+                },
+                "target_node_id": {"type": "string", "description": "ID do nó/computador de destino (ex: PC1, PC2, PC1_CODEX, CLOUD_OPENAI, ALL). Se omitido, é resolvido estritamente pelo cadastro do agente."},
                 "target_queue": {"type": "string", "description": "Fila de destino (padrão: WAITING_ANTIGRAVITY)"},
                 "status": {"type": "string", "description": "Status inicial"},
-                "payload": {"type": "string", "description": "Conteúdo da mensagem"},
-                "metadata": {"type": "object", "description": "Metadados adicionais"}
+                "payload": {"type": "string", "description": "Conteúdo da mensagem (100% opaco para roteamento)"},
+                "metadata": {"type": "object", "description": "Metadados adicionais de envelope"}
             },
-            "required": ["payload"]
+            "required": ["destinatario", "payload"]
         }
     },
     {
@@ -334,6 +338,37 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
     if not payload:
         raise ValueError("payload e obrigatorio")
 
+    dest = (arguments.get("destinatario") or "").upper().strip()
+    if not dest:
+        raise ValueError(
+            "FAIL_ROTEAMENTO_SEM_DESTINATARIO: O campo 'destinatario' e estritamente obrigatorio no envelope. "
+            "Pela Diretriz Soberana L0, o payload e 100% opaco e a inferencia por analise de texto no corpo foi permanentemente desativada."
+        )
+
+    # Synapse Dynamic Agent Registry oficial: mapeamento autoritativo de agentes para seus nos
+    AGENT_REGISTRY = {
+        "ISAAC": "PC1",
+        "NIKOLA": "PC2",
+        "ATLAS": "PC1_CODEX",
+        "CODEX": "PC1_CODEX",
+        "ALITA": "CLOUD_OPENAI",
+        "ALL": "ALL"
+    }
+
+    if dest not in AGENT_REGISTRY:
+        raise ValueError(f"Destinatario '{dest}' invalido. Agentes cadastrados: {list(AGENT_REGISTRY.keys())}")
+
+    resolved_node = AGENT_REGISTRY[dest]
+    target_node = (arguments.get("target_node_id") or "").upper().strip()
+
+    if target_node and target_node != resolved_node and target_node != "ALL" and resolved_node != "ALL":
+        raise ValueError(
+            f"CONFLITO_AUTORIDADE_DESTINO: O destinatario '{dest}' pertence ao no '{resolved_node}', "
+            f"mas target_node_id informado foi '{target_node}'."
+        )
+
+    final_target_node = target_node if target_node else resolved_node
+
     target_queue = arguments.get("target_queue")
     # Todas as tarefas de Alita para a equipe (Isaac, Nikola, Atlas) vão para WAITING_ANTIGRAVITY
     if not target_queue or target_queue == "WAITING_ALITA":
@@ -345,28 +380,9 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
     if authenticated_node_id:
         meta["source_node_id"] = authenticated_node_id
 
-    # Synapse Dynamic Agent Registry: identificação de destinatário e nó (Diretriz Soberana L0)
-    dest = (arguments.get("destinatario") or "").upper().strip()
-    target_node = (arguments.get("target_node_id") or "").upper().strip()
-
-    if not dest:
-        lower_p = payload.lower()
-        if "nikola" in lower_p:
-            dest = "NIKOLA"
-            target_node = target_node or "PC2"
-        elif "isaac" in lower_p:
-            dest = "ISAAC"
-            target_node = target_node or "PC1"
-        elif "atlas" in lower_p or "codex" in lower_p:
-            dest = "ATLAS"
-            target_node = target_node or "PC1_CODEX"
-        else:
-            dest = "ALL"
-            target_node = target_node or "ALL"
-
     meta["recipient_agent_id"] = dest
-    meta["recipient_node_id"] = target_node or "ALL"
-    meta["target_node_id"] = target_node or "ALL"
+    meta["recipient_node_id"] = final_target_node
+    meta["target_node_id"] = final_target_node
 
     body = {
         "id": str(uuid.uuid4()),
