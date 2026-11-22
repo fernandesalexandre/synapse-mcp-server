@@ -767,8 +767,8 @@ def background_auto_retention_worker():
         try:
             cutoff_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
             cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            # Filtro estrito: expurga apenas tarefas com ciclo concluído/processado/expurgado
-            url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?status=in.(COMPLETED,PROCESSED,DELIVERED,EXPURGADO)&created_at=lt.{cutoff_iso}"
+            # Filtro estrito: expurga exclusivamente tarefas comprovadamente concluídas e executadas
+            url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?status=in.(COMPLETED,EXPURGADO)&created_at=lt.{cutoff_iso}"
             headers = {
                 "apikey": API_KEY,
                 "Authorization": f"Bearer {API_KEY}",
