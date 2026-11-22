@@ -17,6 +17,8 @@ import os
 import re
 import json
 import time
+import datetime
+import threading
 import hmac
 import hashlib
 import uuid
@@ -752,9 +754,33 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+def background_auto_retention_worker():
+    """
+    Executa periodicamente na nuvem (a cada 6 horas) para expurgar automaticamente
+    mensagens com mais de 24 horas no Supabase (Diretriz Soberana L0).
+    """
+    while True:
+        try:
+            time.sleep(21600)  # 6 horas
+            cutoff_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
+            cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?created_at=lt.{cutoff_iso}"
+            headers = {
+                "apikey": API_KEY,
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json"
+            }
+            req = urllib.request.Request(url, headers=headers, method="DELETE")
+            with urllib.request.urlopen(req, timeout=15) as _:
+                pass
+        except Exception:
+            pass
+
 def run(port=8001):
     _ = get_node_hmac_secret()
     load_persistent_revocations()
+    # Inicia a thread de higiene e auto-retenção 24h em background
+    threading.Thread(target=background_auto_retention_worker, daemon=True).start()
     server = HTTPServer(("0.0.0.0", port), MCPRequestHandler)
     print(f"=================================================================")
     print(f" SYNAPSE HANDOFF MCP SERVER ONLINE ({SERVER_VERSION})")
