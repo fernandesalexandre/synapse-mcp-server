@@ -118,7 +118,7 @@ class TestRoutingAndSecurityContract(unittest.TestCase):
         self.assertEqual(meta["target_node_id"], "ALL")
         self.assertEqual(self.last_sent_body["target_queue"], "WAITING_ANTIGRAVITY")
 
-    # --- 2. AUTENTICAÇÃO E ACL DE LEITURA / ATUALIZAÇÃO (PARECER ATLAS 791038d5) ---
+    # --- 2. AUTENTICAÇÃO E ACL DE LEITURA / ATUALIZAÇÃO (PARECERES ATLAS 791038d5 & a3b47031) ---
 
     def test_ler_fila_waiting_antigravity_without_auth_fails(self):
         """FAIL ALTA PRIORIDADE: Leitura anônima de WAITING_ANTIGRAVITY DEVE FALHAR."""
@@ -126,11 +126,29 @@ class TestRoutingAndSecurityContract(unittest.TestCase):
             execute_ler_fila({"target_queue": "WAITING_ANTIGRAVITY"}, authenticated_node_id=None)
         self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
 
-    def test_ler_fila_waiting_alita_without_auth_allowed(self):
-        """Leitura de WAITING_ALITA pelo conector web do ChatGPT é autorizada."""
+    def test_ler_fila_waiting_alita_without_auth_fails(self):
+        """RESIDUAL SANADO: Leitura anônima de WAITING_ALITA DEVE FALHAR (zero exceções anônimas)."""
+        with self.assertRaises(PermissionError) as ctx:
+            execute_ler_fila({"target_queue": "WAITING_ALITA"}, authenticated_node_id=None)
+        self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
+
+    def test_ler_fila_waiting_alita_with_cloud_auth_succeeds(self):
+        """Leitura de WAITING_ALITA com conector Cloud autenticado é autorizada."""
         self.mock_db_data = [{"id": "msg-alita-1", "remetente": "ISAAC", "payload": "OK"}]
-        res = execute_ler_fila({"target_queue": "WAITING_ALITA"}, authenticated_node_id=None)
+        res = execute_ler_fila({"target_queue": "WAITING_ALITA"}, authenticated_node_id="CLOUD_OPENAI")
         self.assertEqual(len(res), 1)
+
+    def test_ler_fila_cloud_auth_cross_queue_fails(self):
+        """Conector Cloud tentando acessar fila operacional WAITING_ANTIGRAVITY é bloqueado."""
+        with self.assertRaises(PermissionError) as ctx:
+            execute_ler_fila({"target_queue": "WAITING_ANTIGRAVITY"}, authenticated_node_id="CLOUD_OPENAI")
+        self.assertIn("ACESSO_NEGADO_ISOLAMENTO_DE_FILA", str(ctx.exception))
+
+    def test_ler_fila_physical_node_cross_queue_fails(self):
+        """Nó físico local (PC1) tentando acessar diretamente fila WAITING_ALITA é bloqueado."""
+        with self.assertRaises(PermissionError) as ctx:
+            execute_ler_fila({"target_queue": "WAITING_ALITA"}, authenticated_node_id="PC1")
+        self.assertIn("ACESSO_NEGADO_ISOLAMENTO_DE_FILA", str(ctx.exception))
 
     def test_ler_fila_authenticated_filters_node(self):
         """Leitura autenticada filtra estritamente tarefas do nó autenticado."""
@@ -162,22 +180,28 @@ class TestRoutingAndSecurityContract(unittest.TestCase):
         res = execute_obter_tarefa({"tarefa_id": "task-pc1"}, authenticated_node_id="PC1")
         self.assertEqual(res["status"], "SUCESSO")
 
+    def test_obter_tarefa_cloud_node_succeeds_for_cloud_task(self):
+        """Conector cloud autenticado obtém tarefa de destino cloud."""
+        self.mock_db_data = [{"id": "task-cloud-1", "metadata": {"target_node_id": "CLOUD_OPENAI"}}]
+        res = execute_obter_tarefa({"tarefa_id": "task-cloud-1"}, authenticated_node_id="CLOUD_OPENAI")
+        self.assertEqual(res["status"], "SUCESSO")
+
     def test_atualizar_status_without_auth_fails(self):
         """FAIL ALTA PRIORIDADE: Atualização de status sem autenticação DEVE FALHAR."""
         with self.assertRaises(PermissionError) as ctx:
             execute_atualizar_status({"tarefa_id": "task-1", "novo_status": "COMPLETED"}, authenticated_node_id=None)
         self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
 
-    def test_atualizar_status_cross_node_fails(self):
-        """FAIL ALTA PRIORIDADE: Nó PC2 tentando atualizar tarefa do PC1 DEVE SER BLOQUEADO."""
-        self.mock_db_data = [{"id": "task-pc1", "metadata": {"target_node_id": "PC1"}}]
+    def test_atualizar_status_atomic_cross_node_fails(self):
+        """Mutação atômica em tarefa de outro nó resulta em zero linhas modificadas e erro."""
+        self.mock_db_data = []  # Retorno vazio do PATCH indicando predicado não satisfeito
         with self.assertRaises(PermissionError) as ctx:
             execute_atualizar_status({"tarefa_id": "task-pc1", "novo_status": "COMPLETED"}, authenticated_node_id="PC2")
-        self.assertIn("ACESSO_NEGADO_ISOLAMENTO_DE_NO", str(ctx.exception))
+        self.assertIn("ACESSO_NEGADO_OU_NAO_ENCONTRADO", str(ctx.exception))
 
-    def test_atualizar_status_correct_node_succeeds(self):
-        """Nó proprietário atualiza o status de sua própria tarefa com sucesso."""
-        self.mock_db_data = [{"id": "task-pc1", "metadata": {"target_node_id": "PC1"}}]
+    def test_atualizar_status_atomic_owner_succeeds(self):
+        """Mutação atômica pelo nó proprietário atualiza o status com sucesso."""
+        self.mock_db_data = [{"id": "task-pc1", "status": "COMPLETED"}]
         res = execute_atualizar_status({"tarefa_id": "task-pc1", "novo_status": "COMPLETED"}, authenticated_node_id="PC1")
         self.assertEqual(res["status"], "ATUALIZADO")
 

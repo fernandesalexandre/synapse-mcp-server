@@ -157,21 +157,28 @@ def generate_machine_token(tenant_id: str, node_id: str, secret: str = None, ttl
     sig = hmac.new(sec.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{node_id}.{timestamp}.{ttl_sec}.{sig}"
 
+SYNAPSE_CLOUD_CONNECTOR_BEARER = os.environ.get("SYNAPSE_CLOUD_BEARER_SECRET", "synapse-cloud-bearer-alita-v3-k9a7b2")
+
 def verify_machine_token(token: str, tenant_id: str, secret: str = None) -> tuple:
-    sec = secret or get_node_hmac_secret()
     if not token or not isinstance(token, str):
-        return False, None, "TOKEN_AUSENTE: Token de máquina não informado."
+        return False, None, "TOKEN_AUSENTE: Token de sessao nao informado."
     token_clean = token.strip()
     if token_clean in REVOKED_TOKENS:
-        return False, None, "TOKEN_REVOGADO: A sessão desta máquina foi formalmente revogada."
+        return False, None, "TOKEN_REVOGADO: A sessao desta maquina/conector foi formalmente revogada."
 
+    # 1. Autenticação de Conector Cloud Autorizado (ChatGPT / Alita)
+    if token_clean == SYNAPSE_CLOUD_CONNECTOR_BEARER:
+        return True, "CLOUD_OPENAI", None
+
+    # 2. Autenticação Criptográfica HMAC-SHA256 de Nó Físico (PC1, PC2, PC1_CODEX)
+    sec = secret or get_node_hmac_secret()
     parts = token_clean.split(".")
     if len(parts) != 4:
-        return False, None, "TOKEN_MALFORMADO: Formato esperado 'node_id.timestamp.ttl.signature'."
+        return False, None, "TOKEN_MALFORMADO: Formato esperado 'node_id.timestamp.ttl.signature' ou Bearer cloud."
     node_id, ts_str, ttl_str, received_sig = parts
 
     if received_sig in REVOKED_TOKENS:
-        return False, None, "TOKEN_REVOGADO: A assinatura desta máquina foi formalmente revogada."
+        return False, None, "TOKEN_REVOGADO: A assinatura desta maquina foi formalmente revogada."
 
     try:
         ts = int(ts_str)
@@ -181,12 +188,12 @@ def verify_machine_token(token: str, tenant_id: str, secret: str = None) -> tupl
 
     now = int(time.time())
     if now < ts or (now - ts) > ttl:
-        return False, None, "TOKEN_EXPIRADO: A sessão autenticada desta máquina expirou."
+        return False, None, "TOKEN_EXPIRADO: A sessao autenticada desta maquina expirou."
 
     expected_msg = f"{tenant_id}:{node_id}:{ts}:{ttl}"
     expected_sig = hmac.new(sec.encode("utf-8"), expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(received_sig, expected_sig):
-        return False, None, "ASSINATURA_INVALIDA: Assinatura do token de máquina inválida ou forjada."
+        return False, None, "ASSINATURA_INVALIDA: Assinatura do token de maquina invalida ou forjada."
 
     return True, node_id, None
 
@@ -268,18 +275,28 @@ TOOLS_SCHEMA = [
 ]
 
 def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
-    target_queue = arguments.get("target_queue", "WAITING_ALITA")
-    limit = int(arguments.get("limit", 10))
+    if not authenticated_node_id:
+        raise PermissionError(
+            "AUTENTICACAO_OBRIGATORIA: A leitura de filas exige autenticacao de principal valido (token de maquina ou Bearer cloud). "
+            "Acesso anonimo terminantemente negado antes de qualquer consulta ao backend."
+        )
 
-    # ACL de Leitura (Diretriz Soberana L0 & Parecer Pericial Atlas 791038d5):
-    # - WAITING_ALITA: reservada exclusivamente para o conector web do ChatGPT (Alita na nuvem OpenAI).
-    # - WAITING_ANTIGRAVITY (ou qualquer outra fila local de máquina): EXIGE ESTRITAMENTE machine_token de nó autenticado.
-    if target_queue != "WAITING_ALITA":
-        if not authenticated_node_id:
-            raise PermissionError(
-                "AUTENTICACAO_OBRIGATORIA: A leitura da fila operacional de maquinas (WAITING_ANTIGRAVITY) "
-                "exige token criptografico valido de maquina autorizada (machine_token). Acesso anonimo terminantemente negado."
-            )
+    target_queue = arguments.get("target_queue")
+    if not target_queue:
+        target_queue = "WAITING_ALITA" if authenticated_node_id == "CLOUD_OPENAI" else "WAITING_ANTIGRAVITY"
+
+    # ACL Estrita de Fila por Nó (Diretriz Soberana L0 & Parecer Pericial Atlas a3b47031):
+    if authenticated_node_id == "CLOUD_OPENAI" and target_queue != "WAITING_ALITA":
+        raise PermissionError(
+            f"ACESSO_NEGADO_ISOLAMENTO_DE_FILA: O conector cloud ({authenticated_node_id}) opera exclusivamente na fila WAITING_ALITA. "
+            f"Tentativa de acesso a fila '{target_queue}' negada."
+        )
+    if authenticated_node_id != "CLOUD_OPENAI" and target_queue == "WAITING_ALITA":
+        raise PermissionError(
+            f"ACESSO_NEGADO_ISOLAMENTO_DE_FILA: Nos fisicos locais ({authenticated_node_id}) nao consomem diretamente a fila WAITING_ALITA."
+        )
+
+    limit = int(arguments.get("limit", 10))
 
     query_parts = [
         f"tenant_id=eq.{tenant_id}",
@@ -287,7 +304,7 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
         "order=created_at.desc",
         f"limit={limit}"
     ]
-    if authenticated_node_id and target_queue != "WAITING_ALITA":
+    if authenticated_node_id != "CLOUD_OPENAI":
         query_parts.append(f"metadata->>target_node_id=in.({urllib.parse.quote(authenticated_node_id)},ALL)")
 
     url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{'&'.join(query_parts)}"
@@ -315,6 +332,12 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
         return clean_rows
 
 def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
+    if not authenticated_node_id:
+        raise PermissionError(
+            "AUTENTICACAO_OBRIGATORIA: A obtencao de tarefa exige token de sessao autenticado (machine_token ou Bearer cloud). "
+            "Acesso anonimo terminantemente negado antes de qualquer consulta ao backend."
+        )
+
     tarefa_id = arguments.get("tarefa_id")
     if not tarefa_id:
         raise ValueError("tarefa_id e obrigatorio")
@@ -334,21 +357,12 @@ def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000
         record = rows[0]
         meta = record.get("metadata") or {}
         target_node = meta.get("target_node_id")
-        target_queue = record.get("target_queue")
 
-        # ACL Estrita por Tarefa:
-        # Tarefas operacionais de máquinas locais (WAITING_ANTIGRAVITY ou nó específico) exigem token e isolamento de nó
-        if target_queue != "WAITING_ALITA" or (target_node and target_node in ("PC1", "PC2", "PC1_CODEX")):
-            if not authenticated_node_id:
-                raise PermissionError(
-                    f"AUTENTICACAO_OBRIGATORIA: A tarefa '{tarefa_id}' pertence ao no '{target_node or 'LOCAL'}' "
-                    f"e exige token criptografico valido de maquina autorizada."
-                )
-            if target_node and target_node != "ALL" and target_node != authenticated_node_id:
-                raise PermissionError(
-                    f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} pertence exclusivamente ao computador '{target_node}', "
-                    f"mas foi requisitada pelo no '{authenticated_node_id}'."
-                )
+        if target_node and target_node != "ALL" and target_node != authenticated_node_id:
+            raise PermissionError(
+                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} pertence exclusivamente ao no '{target_node}', "
+                f"mas foi requisitada pelo no '{authenticated_node_id}'."
+            )
 
         return {"status": "SUCESSO", "registro": record}
 
@@ -454,37 +468,22 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     if not tarefa_id or not novo_status:
         raise ValueError("tarefa_id e novo_status sao obrigatorios")
 
-    # ACL de Atualização de Status (Diretriz Soberana L0 & Parecer Pericial Atlas 791038d5):
-    # Exige token de máquina autenticado (machine_token) e valida se a tarefa pertence ao nó solicitante
+    # ACL de Atualização de Status (Diretriz Soberana L0 & Parecer Pericial Atlas a3b47031):
+    # Exige token de máquina/conector autenticado
     if not authenticated_node_id:
         raise PermissionError(
-            "AUTENTICACAO_OBRIGATORIA: A atualizacao de status no Handoff exige token de maquina autenticado (machine_token). "
+            "AUTENTICACAO_OBRIGATORIA: A atualizacao de status no Handoff exige token de sessao autenticado (machine_token ou Bearer). "
             "Acesso anonimo terminantemente negado."
         )
 
-    # Verifica a autoridade sobre a tarefa antes de autorizar a mutação
-    url_get = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}&limit=1"
-    headers_get = {
-        "apikey": API_KEY,
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    req_get = urllib.request.Request(url_get, headers=headers_get, method="GET")
-    with urllib.request.urlopen(req_get, timeout=10) as resp:
-        rows = json.loads(resp.read().decode("utf-8"))
-        if not rows:
-            return {"status": "NAO_ENCONTRADO", "mensagem": f"Nenhuma tarefa com ID {tarefa_id} encontrada"}
-        record = rows[0]
-        meta = record.get("metadata") or {}
-        target_node = meta.get("target_node_id")
-
-        if target_node and target_node != "ALL" and target_node != authenticated_node_id:
-            raise PermissionError(
-                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: Apenas o computador proprietario '{target_node}' pode atualizar o status desta tarefa. "
-                f"Tentativa negada para no '{authenticated_node_id}'."
-            )
-
-    url_patch = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
+    # Mutação Atômica com Predicado de Autoridade de Nó (Elimina TOCTOU):
+    # O PATCH exige que id, tenant_id e target_node_id coincidam de forma transacional no banco
+    url_patch = (
+        f"{SUPABASE_URL}/zuler_ai_handoff_poc?"
+        f"id=eq.{urllib.parse.quote(tarefa_id)}&"
+        f"tenant_id=eq.{tenant_id}&"
+        f"metadata->>target_node_id=in.({urllib.parse.quote(authenticated_node_id)},ALL)"
+    )
     update_data = {"status": novo_status}
     if resultado:
         update_data["resultado"] = resultado
@@ -499,6 +498,11 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     req_update = urllib.request.Request(url_patch, headers=headers_patch, data=json.dumps(update_data).encode("utf-8"), method="PATCH")
     with urllib.request.urlopen(req_update, timeout=10) as resp:
         res = json.loads(resp.read().decode("utf-8"))
+        if not res:
+            # Zero linhas modificadas: ou a tarefa não existe ou pertence a outro nó (violação atômica)
+            raise PermissionError(
+                f"ACESSO_NEGADO_OU_NAO_ENCONTRADO: Tarefa '{tarefa_id}' nao encontrada ou nao pertence ao no '{authenticated_node_id}'."
+            )
         return {"status": "ATUALIZADO", "id": tarefa_id, "novo_status": novo_status}
 
 
