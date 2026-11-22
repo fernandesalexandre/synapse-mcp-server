@@ -284,7 +284,11 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-        if not authenticated_node_id or target_queue == "WAITING_ALITA":
+        if target_queue == "WAITING_ALITA":
+            # Devolve apenas mensagens externas destinadas à Alita (respostas da equipe)
+            # Elimina auto-eco de mensagens geradas pela própria Alita/ChatGPT
+            return [r for r in data if r.get("remetente") not in ("ALITA", "MCP_CLIENT")]
+        if not authenticated_node_id:
             return data
         clean_rows = []
         for r in data:
@@ -323,15 +327,24 @@ def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000
         return {"status": "SUCESSO", "registro": record}
 
 def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
-    remetente = arguments.get("remetente", "MCP_CLIENT")
-    target_queue = arguments.get("target_queue", "WAITING_ALITA")
-    status = arguments.get("status", "WAITING_ALITA")
+    remetente = arguments.get("remetente", "ALITA")
     payload = arguments.get("payload")
-    metadata = arguments.get("metadata", {})
-
     if not payload:
         raise ValueError("payload e obrigatorio")
 
+    target_queue = arguments.get("target_queue")
+    # Auto-roteamento inteligente de fila se não foi especificada
+    if not target_queue or target_queue == "WAITING_ALITA":
+        lower_p = payload.lower()
+        if "atlas" in lower_p or "codex" in lower_p:
+            target_queue = "WAITING_CODEX"
+        elif "isaac" in lower_p or "nikola" in lower_p or "antigravity" in lower_p:
+            target_queue = "WAITING_ANTIGRAVITY"
+        else:
+            target_queue = "WAITING_ANTIGRAVITY"
+
+    status = arguments.get("status") or target_queue
+    metadata = arguments.get("metadata", {})
     meta = dict(metadata) if isinstance(metadata, dict) else {}
     if authenticated_node_id:
         meta["source_node_id"] = authenticated_node_id
