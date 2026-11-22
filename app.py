@@ -382,11 +382,16 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
             )
         final_target_node = "ALL"
 
-    target_queue = arguments.get("target_queue")
-    # Todas as tarefas de Alita para a equipe (Isaac, Nikola, Atlas) vão para WAITING_ANTIGRAVITY
-    if not target_queue or target_queue == "WAITING_ALITA":
-        target_queue = "WAITING_ANTIGRAVITY"
-
+    # Resolução determinística e autoritativa de fila (target_queue) por destinatário:
+    # ALITA consome exclusivamente em WAITING_ALITA; agentes locais (ISAAC, NIKOLA, ATLAS, ALL) em WAITING_ANTIGRAVITY
+    expected_queue = "WAITING_ALITA" if dest == "ALITA" else "WAITING_ANTIGRAVITY"
+    explicit_queue = arguments.get("target_queue")
+    if explicit_queue and explicit_queue != expected_queue:
+        raise ValueError(
+            f"CONFLITO_FILA_DESTINATARIO: O destinatario '{dest}' opera estritamente na fila '{expected_queue}', "
+            f"mas target_queue informada foi '{explicit_queue}'."
+        )
+    target_queue = expected_queue
     status = arguments.get("status") or target_queue
     metadata = arguments.get("metadata", {})
     meta = dict(metadata) if isinstance(metadata, dict) else {}
