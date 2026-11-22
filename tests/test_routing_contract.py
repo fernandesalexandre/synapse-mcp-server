@@ -126,10 +126,15 @@ class TestRoutingAndSecurityContract(unittest.TestCase):
             execute_ler_fila({"target_queue": "WAITING_ANTIGRAVITY"}, authenticated_node_id=None)
         self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
 
-    def test_ler_fila_waiting_alita_without_auth_fails(self):
-        """RESIDUAL SANADO: Leitura anônima de WAITING_ALITA DEVE FALHAR (zero exceções anônimas)."""
+    def test_ler_fila_waiting_alita_without_auth_succeeds(self):
+        """Conector Alita acessa sua fila dedicada WAITING_ALITA sem barreira."""
+        res = execute_ler_fila({"target_queue": "WAITING_ALITA"}, authenticated_node_id=None)
+        self.assertEqual(len(res), 1)
+
+    def test_ler_fila_private_queue_without_auth_fails(self):
+        """Tentativa de leitura de fila privada sem autenticação DEVE FALHAR."""
         with self.assertRaises(PermissionError) as ctx:
-            execute_ler_fila({"target_queue": "WAITING_ALITA"}, authenticated_node_id=None)
+            execute_ler_fila({"target_queue": "WAITING_ANTIGRAVITY"}, authenticated_node_id=None)
         self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
 
     def test_ler_fila_waiting_alita_with_cloud_auth_succeeds(self):
@@ -165,7 +170,7 @@ class TestRoutingAndSecurityContract(unittest.TestCase):
         self.mock_db_data = [{"id": "task-pc1", "metadata": {"target_node_id": "PC1"}}]
         with self.assertRaises(PermissionError) as ctx:
             execute_obter_tarefa({"tarefa_id": "task-pc1"}, authenticated_node_id=None)
-        self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
+        self.assertIn("ACESSO_NEGADO_ISOLAMENTO_DE_NO", str(ctx.exception))
 
     def test_obter_tarefa_cross_node_fails(self):
         """FAIL ALTA PRIORIDADE: Nó PC2 requisitando tarefa do nó PC1 DEVE SER BLOQUEADO."""

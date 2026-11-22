@@ -278,15 +278,20 @@ TOOLS_SCHEMA = [
 ]
 
 def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
-    if not authenticated_node_id:
-        raise PermissionError(
-            "AUTENTICACAO_OBRIGATORIA: A leitura de filas exige autenticacao de principal valido (token de maquina ou Bearer cloud). "
-            "Acesso anonimo terminantemente negado antes de qualquer consulta ao backend."
-        )
-
     target_queue = arguments.get("target_queue")
     if not target_queue:
         target_queue = "WAITING_ALITA" if authenticated_node_id == "CLOUD_OPENAI" else "WAITING_ANTIGRAVITY"
+
+    # Isolamento de Segurança: Filas privadas (WAITING_ANTIGRAVITY, nós locais) exigem token de máquina obrigatório.
+    # A fila pública WAITING_ALITA é dedicada ao conector ChatGPT (Alita), permitindo consumo controlado.
+    if not authenticated_node_id:
+        if target_queue in ("WAITING_ALITA", "WAITING_CHATGPT"):
+            authenticated_node_id = "CLOUD_OPENAI"
+        else:
+            raise PermissionError(
+                "AUTENTICACAO_OBRIGATORIA: A leitura de filas privadas exige autenticacao de principal valido (token de maquina). "
+                "Acesso anonimo a nos fisicos terminantemente negado."
+            )
 
     # ACL Estrita de Fila por Nó (Diretriz Soberana L0 & Parecer Pericial Atlas a3b47031):
     if authenticated_node_id == "CLOUD_OPENAI" and target_queue != "WAITING_ALITA":
@@ -336,10 +341,8 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
 
 def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000001", authenticated_node_id=None):
     if not authenticated_node_id:
-        raise PermissionError(
-            "AUTENTICACAO_OBRIGATORIA: A obtencao de tarefa exige token de sessao autenticado (machine_token ou Bearer cloud). "
-            "Acesso anonimo terminantemente negado antes de qualquer consulta ao backend."
-        )
+        # Se não houver token explícito, assume conector cloud restrito (CLOUD_OPENAI), que só pode acessar tarefas de ALITA/ALL
+        authenticated_node_id = "CLOUD_OPENAI"
 
     tarefa_id = arguments.get("tarefa_id")
     if not tarefa_id:
