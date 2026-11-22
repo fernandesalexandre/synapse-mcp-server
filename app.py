@@ -271,6 +271,16 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
     target_queue = arguments.get("target_queue", "WAITING_ALITA")
     limit = int(arguments.get("limit", 10))
 
+    # ACL de Leitura (Diretriz Soberana L0 & Parecer Pericial Atlas 791038d5):
+    # - WAITING_ALITA: reservada exclusivamente para o conector web do ChatGPT (Alita na nuvem OpenAI).
+    # - WAITING_ANTIGRAVITY (ou qualquer outra fila local de máquina): EXIGE ESTRITAMENTE machine_token de nó autenticado.
+    if target_queue != "WAITING_ALITA":
+        if not authenticated_node_id:
+            raise PermissionError(
+                "AUTENTICACAO_OBRIGATORIA: A leitura da fila operacional de maquinas (WAITING_ANTIGRAVITY) "
+                "exige token criptografico valido de maquina autorizada (machine_token). Acesso anonimo terminantemente negado."
+            )
+
     query_parts = [
         f"tenant_id=eq.{tenant_id}",
         f"target_queue=eq.{urllib.parse.quote(target_queue)}",
@@ -278,7 +288,7 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
         f"limit={limit}"
     ]
     if authenticated_node_id and target_queue != "WAITING_ALITA":
-        query_parts.append(f"metadata->>target_node_id=eq.{urllib.parse.quote(authenticated_node_id)}")
+        query_parts.append(f"metadata->>target_node_id=in.({urllib.parse.quote(authenticated_node_id)},ALL)")
 
     url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?{'&'.join(query_parts)}"
     headers = {
@@ -294,13 +304,13 @@ def execute_ler_fila(arguments, tenant_id="00000000-0000-0000-0000-000000000001"
             # Devolve apenas mensagens externas destinadas à Alita (respostas da equipe)
             # Elimina auto-eco de mensagens geradas pela própria Alita/ChatGPT
             return [r for r in data if r.get("remetente") not in ("ALITA", "MCP_CLIENT")]
-        if not authenticated_node_id:
-            return data
+
+        # Defesa em profundidade: assegura que nenhum nó receba tarefas privadas de outro nó
         clean_rows = []
         for r in data:
             meta = r.get("metadata") or {}
             target_node = meta.get("target_node_id")
-            if not target_node or target_node == authenticated_node_id:
+            if not target_node or target_node in (authenticated_node_id, "ALL"):
                 clean_rows.append(r)
         return clean_rows
 
@@ -324,11 +334,21 @@ def execute_obter_tarefa(arguments, tenant_id="00000000-0000-0000-0000-000000000
         record = rows[0]
         meta = record.get("metadata") or {}
         target_node = meta.get("target_node_id")
+        target_queue = record.get("target_queue")
 
-        if target_node and authenticated_node_id and target_node != authenticated_node_id:
-            raise PermissionError(
-                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} pertence ao computador '{target_node}'."
-            )
+        # ACL Estrita por Tarefa:
+        # Tarefas operacionais de máquinas locais (WAITING_ANTIGRAVITY ou nó específico) exigem token e isolamento de nó
+        if target_queue != "WAITING_ALITA" or (target_node and target_node in ("PC1", "PC2", "PC1_CODEX")):
+            if not authenticated_node_id:
+                raise PermissionError(
+                    f"AUTENTICACAO_OBRIGATORIA: A tarefa '{tarefa_id}' pertence ao no '{target_node or 'LOCAL'}' "
+                    f"e exige token criptografico valido de maquina autorizada."
+                )
+            if target_node and target_node != "ALL" and target_node != authenticated_node_id:
+                raise PermissionError(
+                    f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: A mensagem {tarefa_id} pertence exclusivamente ao computador '{target_node}', "
+                    f"mas foi requisitada pelo no '{authenticated_node_id}'."
+                )
 
         return {"status": "SUCESSO", "registro": record}
 
@@ -433,6 +453,36 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
 
     if not tarefa_id or not novo_status:
         raise ValueError("tarefa_id e novo_status sao obrigatorios")
+
+    # ACL de Atualização de Status (Diretriz Soberana L0 & Parecer Pericial Atlas 791038d5):
+    # Exige token de máquina autenticado (machine_token) e valida se a tarefa pertence ao nó solicitante
+    if not authenticated_node_id:
+        raise PermissionError(
+            "AUTENTICACAO_OBRIGATORIA: A atualizacao de status no Handoff exige token de maquina autenticado (machine_token). "
+            "Acesso anonimo terminantemente negado."
+        )
+
+    # Verifica a autoridade sobre a tarefa antes de autorizar a mutação
+    url_get = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}&limit=1"
+    headers_get = {
+        "apikey": API_KEY,
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    req_get = urllib.request.Request(url_get, headers=headers_get, method="GET")
+    with urllib.request.urlopen(req_get, timeout=10) as resp:
+        rows = json.loads(resp.read().decode("utf-8"))
+        if not rows:
+            return {"status": "NAO_ENCONTRADO", "mensagem": f"Nenhuma tarefa com ID {tarefa_id} encontrada"}
+        record = rows[0]
+        meta = record.get("metadata") or {}
+        target_node = meta.get("target_node_id")
+
+        if target_node and target_node != "ALL" and target_node != authenticated_node_id:
+            raise PermissionError(
+                f"ACESSO_NEGADO_ISOLAMENTO_DE_NO: Apenas o computador proprietario '{target_node}' pode atualizar o status desta tarefa. "
+                f"Tentativa negada para no '{authenticated_node_id}'."
+            )
 
     url_patch = f"{SUPABASE_URL}/zuler_ai_handoff_poc?id=eq.{urllib.parse.quote(tarefa_id)}&tenant_id=eq.{tenant_id}"
     update_data = {"status": novo_status}
@@ -629,12 +679,19 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
             authenticated_node = None
             if raw_token:
-                try:
-                    is_valid, authed_node, err_msg = verify_machine_token(raw_token, tenant_id)
-                    if is_valid:
-                        authenticated_node = authed_node
-                except Exception:
-                    pass
+                is_valid, authed_node, err_msg = verify_machine_token(raw_token, tenant_id)
+                if not is_valid:
+                    res = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "isError": True,
+                            "content": [{"type": "text", "text": f"AUTENTICACAO_INVALIDA: {err_msg}"}]
+                        }
+                    }
+                    self._send_json_response(200, res)
+                    return
+                authenticated_node = authed_node
 
             try:
                 if tool_name == "ler_fila":

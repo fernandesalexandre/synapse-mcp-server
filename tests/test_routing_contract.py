@@ -6,19 +6,27 @@ import sys
 
 # Garante importação do app local
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app import execute_enviar_mensagem
+from app import (
+    execute_enviar_mensagem,
+    execute_ler_fila,
+    execute_obter_tarefa,
+    execute_atualizar_status,
+    generate_machine_token,
+    verify_machine_token
+)
 
-class TestRoutingContract(unittest.TestCase):
+class TestRoutingAndSecurityContract(unittest.TestCase):
     def setUp(self):
         self.mock_urlopen_patcher = mock.patch("urllib.request.urlopen")
         self.mock_urlopen = self.mock_urlopen_patcher.start()
         self.last_sent_body = None
+        self.mock_db_data = [{"id": "test-uuid-mock", "target_queue": "WAITING_ANTIGRAVITY", "metadata": {"target_node_id": "PC1"}}]
 
         def side_effect(req, *args, **kwargs):
             if hasattr(req, "data") and req.data:
                 self.last_sent_body = json.loads(req.data.decode("utf-8"))
             mock_resp = mock.MagicMock()
-            mock_resp.read.return_value = json.dumps([{"id": "test-uuid-mock"}]).encode("utf-8")
+            mock_resp.read.return_value = json.dumps(self.mock_db_data).encode("utf-8")
             mock_resp.__enter__.return_value = mock_resp
             return mock_resp
 
@@ -26,6 +34,8 @@ class TestRoutingContract(unittest.TestCase):
 
     def tearDown(self):
         self.mock_urlopen_patcher.stop()
+
+    # --- 1. ROTEAMENTO DE ENVELOPE E OPACIDADE DE PAYLOAD ---
 
     def test_missing_destinatario_fails(self):
         """FAIL 1: Destinatário ausente deve ser rejeitado imediatamente."""
@@ -107,6 +117,69 @@ class TestRoutingContract(unittest.TestCase):
         self.assertEqual(meta["recipient_node_id"], "ALL")
         self.assertEqual(meta["target_node_id"], "ALL")
         self.assertEqual(self.last_sent_body["target_queue"], "WAITING_ANTIGRAVITY")
+
+    # --- 2. AUTENTICAÇÃO E ACL DE LEITURA / ATUALIZAÇÃO (PARECER ATLAS 791038d5) ---
+
+    def test_ler_fila_waiting_antigravity_without_auth_fails(self):
+        """FAIL ALTA PRIORIDADE: Leitura anônima de WAITING_ANTIGRAVITY DEVE FALHAR."""
+        with self.assertRaises(PermissionError) as ctx:
+            execute_ler_fila({"target_queue": "WAITING_ANTIGRAVITY"}, authenticated_node_id=None)
+        self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
+
+    def test_ler_fila_waiting_alita_without_auth_allowed(self):
+        """Leitura de WAITING_ALITA pelo conector web do ChatGPT é autorizada."""
+        self.mock_db_data = [{"id": "msg-alita-1", "remetente": "ISAAC", "payload": "OK"}]
+        res = execute_ler_fila({"target_queue": "WAITING_ALITA"}, authenticated_node_id=None)
+        self.assertEqual(len(res), 1)
+
+    def test_ler_fila_authenticated_filters_node(self):
+        """Leitura autenticada filtra estritamente tarefas do nó autenticado."""
+        self.mock_db_data = [
+            {"id": "msg-1", "metadata": {"target_node_id": "PC1"}},
+            {"id": "msg-2", "metadata": {"target_node_id": "PC2"}}
+        ]
+        res = execute_ler_fila({"target_queue": "WAITING_ANTIGRAVITY"}, authenticated_node_id="PC1")
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["metadata"]["target_node_id"], "PC1")
+
+    def test_obter_tarefa_without_auth_fails(self):
+        """FAIL ALTA PRIORIDADE: Obtenção de tarefa local sem autenticação DEVE FALHAR."""
+        self.mock_db_data = [{"id": "task-pc1", "metadata": {"target_node_id": "PC1"}}]
+        with self.assertRaises(PermissionError) as ctx:
+            execute_obter_tarefa({"tarefa_id": "task-pc1"}, authenticated_node_id=None)
+        self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
+
+    def test_obter_tarefa_cross_node_fails(self):
+        """FAIL ALTA PRIORIDADE: Nó PC2 requisitando tarefa do nó PC1 DEVE SER BLOQUEADO."""
+        self.mock_db_data = [{"id": "task-pc1", "metadata": {"target_node_id": "PC1"}}]
+        with self.assertRaises(PermissionError) as ctx:
+            execute_obter_tarefa({"tarefa_id": "task-pc1"}, authenticated_node_id="PC2")
+        self.assertIn("ACESSO_NEGADO_ISOLAMENTO_DE_NO", str(ctx.exception))
+
+    def test_obter_tarefa_correct_node_succeeds(self):
+        """Nó proprietário obtém sua própria tarefa com sucesso."""
+        self.mock_db_data = [{"id": "task-pc1", "metadata": {"target_node_id": "PC1"}}]
+        res = execute_obter_tarefa({"tarefa_id": "task-pc1"}, authenticated_node_id="PC1")
+        self.assertEqual(res["status"], "SUCESSO")
+
+    def test_atualizar_status_without_auth_fails(self):
+        """FAIL ALTA PRIORIDADE: Atualização de status sem autenticação DEVE FALHAR."""
+        with self.assertRaises(PermissionError) as ctx:
+            execute_atualizar_status({"tarefa_id": "task-1", "novo_status": "COMPLETED"}, authenticated_node_id=None)
+        self.assertIn("AUTENTICACAO_OBRIGATORIA", str(ctx.exception))
+
+    def test_atualizar_status_cross_node_fails(self):
+        """FAIL ALTA PRIORIDADE: Nó PC2 tentando atualizar tarefa do PC1 DEVE SER BLOQUEADO."""
+        self.mock_db_data = [{"id": "task-pc1", "metadata": {"target_node_id": "PC1"}}]
+        with self.assertRaises(PermissionError) as ctx:
+            execute_atualizar_status({"tarefa_id": "task-pc1", "novo_status": "COMPLETED"}, authenticated_node_id="PC2")
+        self.assertIn("ACESSO_NEGADO_ISOLAMENTO_DE_NO", str(ctx.exception))
+
+    def test_atualizar_status_correct_node_succeeds(self):
+        """Nó proprietário atualiza o status de sua própria tarefa com sucesso."""
+        self.mock_db_data = [{"id": "task-pc1", "metadata": {"target_node_id": "PC1"}}]
+        res = execute_atualizar_status({"tarefa_id": "task-pc1", "novo_status": "COMPLETED"}, authenticated_node_id="PC1")
+        self.assertEqual(res["status"], "ATUALIZADO")
 
 if __name__ == "__main__":
     unittest.main()
