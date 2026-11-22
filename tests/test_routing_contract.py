@@ -214,5 +214,38 @@ class TestRoutingAndSecurityContract(unittest.TestCase):
         self.assertEqual(self.last_sent_body["status"], "COMPLETED")
         self.assertEqual(self.last_sent_body["payload"], "[CONCLUIDO_E_EXPURGADO]")
 
+    def test_verify_cloud_bearer_fail_closed(self):
+        """FAIL 1 AUDITORIA: Bearer Cloud falha fechado quando não configurado."""
+        import app
+        orig_bearer = app.SYNAPSE_CLOUD_CONNECTOR_BEARER
+        try:
+            # Caso 1: Bearer não configurado (vazio) -> qualquer token cloud falha
+            app.SYNAPSE_CLOUD_CONNECTOR_BEARER = ""
+            ok, node, err = app.verify_machine_token("qualquer-bearer", tenant_id="default", secret="test-secret")
+            self.assertFalse(ok)
+            self.assertNotEqual(node, "CLOUD_OPENAI")
+
+            # Caso 2: Bearer configurado em runtime
+            app.SYNAPSE_CLOUD_CONNECTOR_BEARER = "segredo-forte-provisionado-123"
+            # Token correto aceito como CLOUD_OPENAI
+            ok, node, err = app.verify_machine_token("segredo-forte-provisionado-123", tenant_id="default", secret="test-secret")
+            self.assertTrue(ok)
+            self.assertEqual(node, "CLOUD_OPENAI")
+
+            # Token incorreto rejeitado
+            ok, node, err = app.verify_machine_token("token-incorreto", tenant_id="default", secret="test-secret")
+            self.assertFalse(ok)
+        finally:
+            app.SYNAPSE_CLOUD_CONNECTOR_BEARER = orig_bearer
+
+    def test_auto_retention_preserves_pending_tasks(self):
+        """FAIL 2 AUDITORIA: Auto-retenção requer status concluído para não expurgar pendências."""
+        import app
+        import inspect
+        source = inspect.getsource(app.background_auto_retention_worker)
+        # O filtro DEVE conter status=in.(COMPLETED...) e created_at=lt.
+        self.assertIn("status=in.(COMPLETED", source)
+        self.assertIn("created_at=lt.", source)
+
 if __name__ == "__main__":
     unittest.main()

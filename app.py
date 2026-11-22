@@ -159,7 +159,7 @@ def generate_machine_token(tenant_id: str, node_id: str, secret: str = None, ttl
     sig = hmac.new(sec.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{node_id}.{timestamp}.{ttl_sec}.{sig}"
 
-SYNAPSE_CLOUD_CONNECTOR_BEARER = os.environ.get("SYNAPSE_CLOUD_BEARER_SECRET", "synapse-cloud-bearer-alita-v3-k9a7b2")
+SYNAPSE_CLOUD_CONNECTOR_BEARER = (os.environ.get("SYNAPSE_CLOUD_BEARER_SECRET") or "").strip()
 
 def verify_machine_token(token: str, tenant_id: str, secret: str = None) -> tuple:
     if not token or not isinstance(token, str):
@@ -169,7 +169,8 @@ def verify_machine_token(token: str, tenant_id: str, secret: str = None) -> tupl
         return False, None, "TOKEN_REVOGADO: A sessao desta maquina/conector foi formalmente revogada."
 
     # 1. Autenticação de Conector Cloud Autorizado (ChatGPT / Alita)
-    if token_clean == SYNAPSE_CLOUD_CONNECTOR_BEARER:
+    # Fail closed: Se SYNAPSE_CLOUD_CONNECTOR_BEARER não estiver configurado no ambiente, recusa
+    if SYNAPSE_CLOUD_CONNECTOR_BEARER and token_clean == SYNAPSE_CLOUD_CONNECTOR_BEARER:
         return True, "CLOUD_OPENAI", None
 
     # 2. Autenticação Criptográfica HMAC-SHA256 de Nó Físico (PC1, PC2, PC1_CODEX)
@@ -756,25 +757,33 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
 def background_auto_retention_worker():
     """
-    Executa periodicamente na nuvem (a cada 6 horas) para expurgar automaticamente
-    mensagens com mais de 24 horas no Supabase (Diretriz Soberana L0).
+    Executa periodicamente na nuvem para expurgar automaticamente mensagens
+    CONCLUÍDAS/PROCESSADAS com mais de 24 horas no Supabase (Diretriz Soberana L0).
+    Tarefas pendentes são estritamente PRESERVADAS (anti-perda silenciosa).
     """
+    # Breve intervalo de aquecimento inicial (60s) para não atrasar a inicialização
+    time.sleep(60)
     while True:
         try:
-            time.sleep(21600)  # 6 horas
             cutoff_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=24)
             cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?created_at=lt.{cutoff_iso}"
+            # Filtro estrito: expurga apenas tarefas com ciclo concluído/processado/expurgado
+            url = f"{SUPABASE_URL}/zuler_ai_handoff_poc?status=in.(COMPLETED,PROCESSED,DELIVERED,EXPURGADO)&created_at=lt.{cutoff_iso}"
             headers = {
                 "apikey": API_KEY,
                 "Authorization": f"Bearer {API_KEY}",
                 "Content-Type": "application/json"
             }
             req = urllib.request.Request(url, headers=headers, method="DELETE")
-            with urllib.request.urlopen(req, timeout=15) as _:
-                pass
-        except Exception:
-            pass
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                status_code = resp.getcode()
+                if status_code in (200, 204):
+                    print(f"[AUTO_RETENTION] Ciclo executado com sucesso para cutoff < {cutoff_iso}")
+        except Exception as e:
+            print(f"[AUTO_RETENTION] Erro no ciclo de retencao automatica: {e}")
+        
+        # Executa a cada 2 horas (mantendo a janela rolling de 24h sem acúmulo excessivo)
+        time.sleep(7200)
 
 def run(port=8001):
     _ = get_node_hmac_secret()
