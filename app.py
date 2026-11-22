@@ -333,15 +333,9 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
         raise ValueError("payload e obrigatorio")
 
     target_queue = arguments.get("target_queue")
-    # Auto-roteamento inteligente de fila se não foi especificada
+    # Todas as tarefas de Alita para a equipe (Isaac, Nikola, Atlas) vão para WAITING_ANTIGRAVITY
     if not target_queue or target_queue == "WAITING_ALITA":
-        lower_p = payload.lower()
-        if "atlas" in lower_p or "codex" in lower_p:
-            target_queue = "WAITING_CODEX"
-        elif "isaac" in lower_p or "nikola" in lower_p or "antigravity" in lower_p:
-            target_queue = "WAITING_ANTIGRAVITY"
-        else:
-            target_queue = "WAITING_ANTIGRAVITY"
+        target_queue = "WAITING_ANTIGRAVITY"
 
     status = arguments.get("status") or target_queue
     metadata = arguments.get("metadata", {})
