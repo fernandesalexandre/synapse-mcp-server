@@ -232,12 +232,14 @@ TOOLS_SCHEMA = [
     },
     {
         "name": "enviar_mensagem",
-        "description": "Envia uma nova mensagem/diretriz para a fila do Handoff carimbando a máquina de origem autenticada.",
+        "description": "Envia uma nova mensagem/diretriz para a fila do Handoff carimbando a máquina de origem e o destinatário nominal com isolamento estrito de nó.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "remetente": {"type": "string", "description": "Nome do remetente"},
-                "target_queue": {"type": "string", "description": "Fila de destino"},
+                "destinatario": {"type": "string", "description": "Nome ou ID da IA destinatária (ex: ISAAC, NIKOLA, ATLAS, ALL). Se omitido, é detectado automaticamente."},
+                "target_node_id": {"type": "string", "description": "ID do computador de destino (ex: PC1, PC2, ALL)"},
+                "target_queue": {"type": "string", "description": "Fila de destino (padrão: WAITING_ANTIGRAVITY)"},
                 "status": {"type": "string", "description": "Status inicial"},
                 "payload": {"type": "string", "description": "Conteúdo da mensagem"},
                 "metadata": {"type": "object", "description": "Metadados adicionais"}
@@ -342,6 +344,29 @@ def execute_enviar_mensagem(arguments, tenant_id="00000000-0000-0000-0000-000000
     meta = dict(metadata) if isinstance(metadata, dict) else {}
     if authenticated_node_id:
         meta["source_node_id"] = authenticated_node_id
+
+    # Synapse Dynamic Agent Registry: identificação de destinatário e nó (Diretriz Soberana L0)
+    dest = (arguments.get("destinatario") or "").upper().strip()
+    target_node = (arguments.get("target_node_id") or "").upper().strip()
+
+    if not dest:
+        lower_p = payload.lower()
+        if "nikola" in lower_p:
+            dest = "NIKOLA"
+            target_node = target_node or "PC2"
+        elif "isaac" in lower_p:
+            dest = "ISAAC"
+            target_node = target_node or "PC1"
+        elif "atlas" in lower_p or "codex" in lower_p:
+            dest = "ATLAS"
+            target_node = target_node or "PC1_CODEX"
+        else:
+            dest = "ALL"
+            target_node = target_node or "ALL"
+
+    meta["recipient_agent_id"] = dest
+    meta["recipient_node_id"] = target_node or "ALL"
+    meta["target_node_id"] = target_node or "ALL"
 
     body = {
         "id": str(uuid.uuid4()),
