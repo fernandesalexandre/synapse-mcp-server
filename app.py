@@ -487,6 +487,9 @@ def execute_atualizar_status(arguments, tenant_id="00000000-0000-0000-0000-00000
     update_data = {"status": novo_status}
     if resultado:
         update_data["resultado"] = resultado
+    # Diretriz Soberana L0 de Retenção & Privacidade: Ao concluir a tarefa, expurga o payload para zero acúmulo de dados
+    if novo_status == "COMPLETED":
+        update_data["payload"] = "[CONCLUIDO_E_EXPURGADO]"
 
     headers_patch = {
         "apikey": API_KEY,

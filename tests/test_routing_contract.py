@@ -205,5 +205,14 @@ class TestRoutingAndSecurityContract(unittest.TestCase):
         res = execute_atualizar_status({"tarefa_id": "task-pc1", "novo_status": "COMPLETED"}, authenticated_node_id="PC1")
         self.assertEqual(res["status"], "ATUALIZADO")
 
+    def test_atualizar_status_completed_purges_payload(self):
+        """Diretriz Soberana L0: Concluir tarefa expurga imediatamente o payload no PATCH."""
+        self.mock_db_data = [{"id": "task-pc1", "status": "COMPLETED", "payload": "[CONCLUIDO_E_EXPURGADO]"}]
+        res = execute_atualizar_status({"tarefa_id": "task-pc1", "novo_status": "COMPLETED"}, authenticated_node_id="PC1")
+        self.assertEqual(res["status"], "ATUALIZADO")
+        self.assertIsNotNone(self.last_sent_body)
+        self.assertEqual(self.last_sent_body["status"], "COMPLETED")
+        self.assertEqual(self.last_sent_body["payload"], "[CONCLUIDO_E_EXPURGADO]")
+
 if __name__ == "__main__":
     unittest.main()
